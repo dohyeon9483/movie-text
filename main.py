@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 import whisper
+import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +17,10 @@ from pydub import AudioSegment
 import google.generativeai as genai
 
 import database as db
+
+# 동시 변환 제한 (VRAM/CPU 부하 방지)
+# 한 번에 1개씩만 음성 인식을 수행하도록 제한
+transcription_semaphore = asyncio.Semaphore(1)
 
 # Pydantic 모델
 class ApiKeyRequest(BaseModel):
@@ -59,9 +64,14 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Whisper 모델 로드 (base 모델 사용, 더 큰 모델이 필요하면 'medium' 또는 'large'로 변경)
-print("Whisper 모델을 로드하는 중...")
-model = whisper.load_model("base")
+# GPU 사용 가능 여부 확인
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"사용 장치: {device}")
+
+# Whisper 모델 로드 (turbo 모델 사용 - 속도와 정확도의 최상의 균형)
+# 메모리가 부족하다면 'small' 또는 'base'로 변경하세요.
+print(f"Whisper 모델('turbo')을 {device}에 로드하는 중...")
+model = whisper.load_model("turbo", device=device)
 print("Whisper 모델 로드 완료!")
 
 
@@ -76,25 +86,42 @@ async def send_progress(message: str, progress: int, status: str = "processing")
 
 
 def extract_audio_from_video(video_path: str, audio_path: str) -> bool:
-    """MP4 비디오에서 오디오를 추출합니다."""
+    """영상/음성 파일에서 Whisper 최적화 오디오(16kHz, Mono)를 추출합니다."""
     try:
-        # pydub을 사용하여 오디오 추출
-        video = AudioSegment.from_file(video_path, format="mp4")
-        video.export(audio_path, format="wav")
+        # pydub을 사용하여 오디오 추출 및 전처리
+        audio = AudioSegment.from_file(video_path)
+        
+        # Whisper 최적화: 16,000Hz, Mono 채널 설정
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        
+        # WAV 형식으로 저장
+        audio.export(audio_path, format="wav")
         return True
     except Exception as e:
-        print(f"오디오 추출 오류: {e}")
+        print(f"오디오 전처리 오류: {e}")
         return False
 
 
-def transcribe_audio(audio_path: str, language: str = "ko") -> Optional[str]:
-    """Whisper를 사용하여 오디오를 텍스트로 변환합니다."""
-    try:
-        result = model.transcribe(audio_path, language=language, fp16=False, verbose=False)
-        return result["text"]
-    except Exception as e:
-        print(f"음성 인식 오류: {e}")
-        return None
+async def transcribe_audio_async(audio_path: str, language: str = "ko") -> Optional[str]:
+    """Whisper를 사용하여 오디오를 텍스트로 변환합니다 (비동기 스레드 실행)."""
+    async with transcription_semaphore:
+        try:
+            # initial_prompt: 한국어 문장 부호와 정확도를 높이기 위한 힌트
+            initial_prompt = "이것은 한국어 음성 녹음 파일입니다. 정확한 문장 부호와 띄어쓰기를 사용하여 텍스트로 변환해주세요."
+            
+            # asyncio.to_thread를 사용하여 CPU 집약적인 작업을 별도 스레드에서 실행
+            result = await asyncio.to_thread(
+                model.transcribe,
+                audio_path, 
+                language=language, 
+                fp16=(device == "cuda"), 
+                verbose=False,
+                initial_prompt=initial_prompt
+            )
+            return result["text"].strip()
+        except Exception as e:
+            print(f"음성 인식 오류: {e}")
+            return None
 
 
 async def summarize_with_gemini(text: str, summary_type: str = "general") -> Optional[str]:
@@ -309,9 +336,11 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             await asyncio.sleep(0.2)
             
             # 8. 음성 인식 중 (가장 시간이 오래 걸림)
-            yield await send_progress(f"{file_prefix}: 음성 인식 중... (시간이 다소 걸릴 수 있습니다)", 65, "processing")
-            print("음성 인식 중...")
-            text = transcribe_audio(str(audio_path), language="ko")
+            yield await send_progress(f"{file_prefix}: 음성 인식 중... (대기 중일 수 있습니다)", 65, "processing")
+            print(f"음성 인식 시작: {file.filename}")
+            
+            # 비동기로 음성 인식 실행 (세마포어 적용됨)
+            text = await transcribe_audio_async(str(audio_path), language="ko")
             
             if text is None:
                 yield await send_progress(f"{file_prefix}: 음성 인식 실패", 0, "error")

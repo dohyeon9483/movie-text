@@ -15,9 +15,15 @@ ENV/
 # Database & User Data
 database.json
 files_db.json
+files_db.sqlite
+files_db.sqlite-journal
+*.bak
+*.json.bak
 
 # Uploads & Temporary Files
 uploads/
+recording_*.mp4
+recording_*.wav
 *.mp4
 *.mp3
 *.wav
