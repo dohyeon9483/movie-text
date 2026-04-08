@@ -419,6 +419,11 @@ function handleProgressUpdate(data) {
                 
                 if (status === 'completed' && text !== undefined) {
                     completedResults.push({ filename, text });
+                    
+                    // 변환 완료 시 자동 다운로드 실행
+                    setTimeout(() => {
+                        downloadSingleResult(filename, text);
+                    }, 500); // UI 업데이트 시간을 고려한 약간의 딜레이
                 }
             }
         }

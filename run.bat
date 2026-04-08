@@ -1,34 +1,39 @@
 @echo off
 title MP4 to Text Converter
+setlocal
+
+cd /d "%~dp0"
+
+set "VENV_PY=%~dp0venv\Scripts\python.exe"
 
 echo ================================
 echo   Starting Server...
 echo ================================
 echo.
 
-REM Check Python
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python is not installed.
+REM Check venv python
+if not exist "%VENV_PY%" (
+    echo [ERROR] venv Python not found.
+    echo Create venv first:
+    echo   python -m venv venv
     pause
     exit /b 1
 )
 
-REM Check if packages are installed
+REM Check packages
 echo Checking packages...
-python -c "import fastapi, uvicorn, whisper, pydub, google.generativeai" >nul 2>&1
+"%VENV_PY%" -c "import fastapi, uvicorn, whisper, pydub, google.generativeai, dotenv" >nul 2>&1
 if errorlevel 1 (
     echo Installing required packages...
     echo This may take a few minutes on first run...
     echo.
-    pip install -r requirements.txt
+    "%VENV_PY%" -m pip install -r requirements.txt
     echo.
     echo Installation complete!
 ) else (
     echo All packages are already installed.
 )
 
-REM Start server
 echo.
 echo ================================
 echo   Server URL: http://localhost:8000
@@ -37,11 +42,9 @@ echo   Press Ctrl+C to stop
 echo ================================
 echo.
 
-REM Open browser after 3 seconds
 start "" cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:8000"
 
-REM Run server
-python main.py
+REM Run server with venv python
+"%VENV_PY%" start_server.py
 
 pause
-
