@@ -17,6 +17,7 @@ def check_dependencies():
         import whisper
         import pydub
         import uvicorn
+        from google import genai
         print("✓ 모든 패키지가 설치되어 있습니다.")
         return True
     except ImportError as e:

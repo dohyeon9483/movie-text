@@ -3,222 +3,287 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>영상 음성 변환기</title>
+    <title>영상 제작 작업 보드</title>
     <link rel="stylesheet" href="/static/style.css">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🎬 영상 음성 변환기</h1>
-            <p>영상/음성을 텍스트로 자동 변환해드립니다</p>
-            
-            <!-- 네비게이션 -->
+            <h1>영상 제작 작업 보드</h1>
+            <p>영상과 SRT를 작업 카드로 관리하고 자막, 음성, 더빙 영상을 생성합니다</p>
             <nav class="main-nav">
-                <button id="navHome" class="nav-btn active">🏠 홈</button>
-                <button id="navDashboard" class="nav-btn">📊 대시보드</button>
-                <button id="navSettings" class="nav-btn">⚙️ 설정</button>
+                <button id="navHome" class="nav-btn active">홈</button>
+                <button id="navSettings" class="nav-btn">설정</button>
             </nav>
         </header>
 
-        <!-- 모드 선택 화면 -->
-        <div id="modeSelection" class="mode-selection">
-            <div class="mode-card" id="recordMode">
-                <div class="mode-icon">🎤</div>
-                <h2>마이크로 녹음하기</h2>
-                <p>실시간으로 음성을 녹음하고<br>텍스트로 변환합니다</p>
-                <button class="mode-btn">시작하기</button>
-            </div>
-            <div class="mode-card" id="uploadMode">
-                <div class="mode-icon">📁</div>
-                <h2>파일 업로드하기</h2>
-                <p>영상/음성 파일을 업로드하고<br>텍스트로 변환합니다</p>
-                <button class="mode-btn">시작하기</button>
-            </div>
-        </div>
-
-        <!-- 녹음 화면 -->
-        <div id="recordSection" class="section hidden">
-            <div class="record-container">
-                <button id="backToModeFromRecord" class="back-btn">← 돌아가기</button>
-                
-                <div class="record-status">
-                    <div class="record-visualizer">
-                        <div class="record-icon" id="recordIcon">🎤</div>
-                        <div class="record-pulse" id="recordPulse"></div>
-                    </div>
-                    <h2 id="recordStatusText">녹음 준비</h2>
-                    <p id="recordTime" class="record-time">00:00</p>
+        <main id="homeSection" class="board-section">
+            <section class="board-toolbar">
+                <div>
+                    <p class="workflow-kicker">Production board</p>
+                    <h2>다중 영상 작업</h2>
                 </div>
-
-                <div class="record-controls">
-                    <button id="startRecordBtn" class="btn-record">
-                        <span class="btn-icon">⏺</span>
-                        녹음 시작
-                    </button>
-                    <button id="stopRecordBtn" class="btn-stop hidden">
-                        <span class="btn-icon">⏹</span>
-                        녹음 중지
-                    </button>
-                    <button id="processRecordBtn" class="btn-process hidden">
-                        <span class="btn-icon">✨</span>
-                        변환 시작
-                    </button>
+                <div class="board-actions">
+                    <input type="file" id="boardFileInput" accept=".mp4,.mov,.avi,.mkv,.webm" multiple hidden>
+                    <button id="boardUploadBtn" class="btn-action primary">영상 업로드</button>
+                    <button id="openScriptJobBtn" class="btn-action secondary">SRT로 새 작업</button>
                 </div>
+            </section>
 
-                <div id="recordInfo" class="record-info">
-                    <p>💡 녹음 버튼을 눌러 시작하세요</p>
-                    <p>🔴 녹음 중일 때 중지 버튼을 눌러 완료하세요</p>
-                </div>
-            </div>
-        </div>
+            <section class="board-filters">
+                <input type="text" id="boardSearchInput" class="search-input" placeholder="파일명 또는 작업명 검색">
+                <select id="boardStatusFilter" class="api-key-input">
+                    <option value="all">전체 상태</option>
+                    <option value="running">진행 중</option>
+                    <option value="completed">완료</option>
+                    <option value="failed">오류</option>
+                    <option value="idle">대기</option>
+                </select>
+                <button id="selectAllCardsBtn" class="btn-toolbar">전체 선택</button>
+                <button id="clearCardSelectionBtn" class="btn-toolbar">선택 해제</button>
+                <button id="downloadSelectedCardsBtn" class="btn-toolbar primary">선택 SRT 다운로드</button>
+                <button id="deleteSelectedCardsBtn" class="btn-toolbar danger">선택 삭제</button>
+            </section>
 
-        <!-- 파일 업로드 화면 -->
-        <div id="uploadSection" class="section hidden">
-            <button id="backToModeFromUpload" class="back-btn">← 돌아가기</button>
-            
-            <div class="upload-area">
-                <div id="dropZone" class="drop-zone">
-                    <div class="drop-zone-content">
-                        <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                        </svg>
-                        <h2>파일을 드래그하거나 클릭하세요</h2>
-                        <p class="file-types">
-                            <strong>영상:</strong> MP4, MOV, AVI, MKV<br>
-                            <strong>음성:</strong> MP3, WAV, M4A, FLAC<br>
-                            <strong>텍스트:</strong> TXT
-                        </p>
-                        <p class="multiple-info">💡 여러 파일을 한번에 선택 가능합니다</p>
-                    </div>
-                    <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.mkv,.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.opus,.webm,.txt" multiple hidden>
-                </div>
+            <div id="uploadQueue" class="upload-queue hidden"></div>
+            <section id="jobBoard" class="job-board">
+                <div class="loading">작업을 불러오는 중...</div>
+            </section>
+        </main>
 
-                <div id="progressSection" class="progress-section hidden">
-                    <div id="filesProgress"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 결과 화면 -->
-        <div id="resultSection" class="result-section hidden">
-            <button id="backToModeFromResult" class="back-btn">← 새로 시작하기</button>
-            
-            <div class="result-header">
-                <h2>변환 결과</h2>
-                <button id="downloadAllBtn" class="btn-download">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    전체 다운로드
-                </button>
-            </div>
-            <div id="resultsContainer"></div>
-        </div>
-
-        <!-- 대시보드 화면 -->
-        <div id="dashboardSection" class="section hidden">
-            <div class="dashboard-header">
-                <h2>📊 내 파일 관리</h2>
-                <div class="dashboard-actions">
-                    <input type="text" id="searchInput" class="search-input" placeholder="🔍 파일 검색...">
-                    <button id="newFileBtn" class="btn-new-file">+ 새로 추가</button>
-                </div>
-            </div>
-
-            <div class="dashboard-toolbar">
-                <div class="checkbox-actions">
-                    <button id="selectAllBtn" class="btn-toolbar">전체 선택</button>
-                    <button id="deselectAllBtn" class="btn-toolbar">전체 해제</button>
-                </div>
-                <div class="bulk-actions">
-                    <button id="downloadSelectedBtn" class="btn-toolbar primary">📥 선택 다운로드</button>
-                    <button id="deleteSelectedBtn" class="btn-toolbar danger">🗑️ 선택 삭제</button>
-                </div>
-            </div>
-
-            <div id="filesTable" class="files-table">
-                <div class="loading">파일 목록을 불러오는 중...</div>
-            </div>
-        </div>
-
-        <!-- 설정 화면 -->
-        <div id="settingsSection" class="section hidden">
-            <h2>⚙️ 설정</h2>
-            
+        <section id="settingsSection" class="section hidden">
+            <h2>설정</h2>
             <div class="settings-card">
-                <h3>🤖 Gemini API 키</h3>
-                <p class="settings-desc">AI 요약 기능을 사용하려면 Google Gemini API 키가 필요합니다.</p>
-                
+                <h3>Gemini API 키</h3>
+                <p class="settings-desc">한국어 SRT 보정, 영어 자막 변환, Gemini TTS, 영상 더빙, AI 요약 기능에 사용됩니다.</p>
                 <div class="api-key-status">
-                    <span id="apiKeyStatus">❌ API 키가 설정되지 않음</span>
+                    <span id="apiKeyStatus">API 키가 설정되지 않음</span>
                 </div>
-                
                 <div class="api-key-input-group">
                     <input type="password" id="apiKeyInput" class="api-key-input" placeholder="Gemini API 키를 입력하세요">
                     <button id="saveApiKeyBtn" class="btn-save-key">저장</button>
                 </div>
-                
-                <div class="settings-info">
-                    <p><strong>API 키 발급 방법:</strong></p>
-                    <ol>
-                        <li><a href="https://makersuite.google.com/app/apikey" target="_blank">Google AI Studio</a>에 접속</li>
-                        <li>"Get API Key" 또는 "Create API Key" 클릭</li>
-                        <li>생성된 키를 복사하여 위에 입력</li>
-                        <li>"저장" 버튼 클릭</li>
-                    </ol>
-                    <p class="note">💡 입력한 API 키는 현재 세션에만 저장됩니다. 브라우저를 닫으면 다시 입력해야 합니다.</p>
+            </div>
+        </section>
+
+        <div id="scriptJobModal" class="modal hidden">
+            <div class="modal-content compact-modal">
+                <div class="modal-header">
+                    <h3>SRT로 새 작업 만들기</h3>
+                    <button id="scriptJobCloseBtn" class="modal-close">×</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <input id="scriptJobNameInput" class="api-key-input" placeholder="작업명 예: tutorial_en">
+                        <select id="scriptJobLanguageSelect" class="api-key-input">
+                            <option value="ko">한국어 SRT</option>
+                            <option value="en">English SRT</option>
+                        </select>
+                    </div>
+                    <textarea id="scriptJobSrtInput" class="workflow-srt" placeholder="SRT 내용을 붙여넣으세요"></textarea>
+                </div>
+                <div class="modal-footer">
+                    <button id="createScriptJobBtn" class="btn-action primary">작업 생성</button>
                 </div>
             </div>
         </div>
 
-        <!-- 파일 상세 모달 -->
         <div id="fileModal" class="modal hidden">
             <div class="modal-content">
                 <div class="modal-header">
                     <h3 id="modalFilename"></h3>
-                    <button class="modal-close">×</button>
+                    <button class="modal-close" id="fileModalCloseBtn">×</button>
                 </div>
-                
+
                 <div class="modal-tabs">
-                    <button class="tab-btn active" data-tab="original">원본</button>
-                    <button class="tab-btn" data-tab="general">일반 요약</button>
-                    <button class="tab-btn" data-tab="meeting">회의록</button>
-                    <button class="tab-btn" data-tab="lecture">강의 요약</button>
-                    <button class="tab-btn" data-tab="youtube">영상 요약</button>
-                    <button class="tab-btn" data-tab="conversation">대화 요약</button>
+                    <button class="tab-btn active" data-tab="korean_srt">한국어 SRT</button>
+                    <button class="tab-btn" data-tab="corrected_srt">보정 SRT</button>
+                    <button class="tab-btn" data-tab="english_srt">English SRT</button>
+                    <button class="tab-btn" data-tab="audio_video">제작</button>
+                    <button class="tab-btn" data-tab="artifacts">산출물</button>
                 </div>
-                
+
                 <div id="modalBody" class="modal-body">
-                    <div class="tab-content active" data-content="original">
-                        <div class="loading">로딩 중...</div>
+                    <div class="tab-content active" data-content="korean_srt">
+                        <textarea id="modalKoSrt" class="workflow-srt" readonly></textarea>
+                        <div class="tab-action-row">
+                            <button id="modalCorrectBtn" class="btn-action">한국어 SRT 보정</button>
+                            <button class="btn-action" data-download-srt="ko">한국어 SRT 다운로드</button>
+                        </div>
                     </div>
-                    <div class="tab-content" data-content="general">
-                        <div class="summary-placeholder">요약 생성 버튼을 클릭하세요</div>
+                    <div class="tab-content" data-content="corrected_srt">
+                        <textarea id="modalCorrectedSrt" class="workflow-srt" placeholder="보정 결과가 여기에 표시됩니다. 직접 수정할 수도 있습니다."></textarea>
+                        <div class="tab-action-row">
+                            <button id="saveCorrectedSrtBtn" class="btn-toolbar">보정 SRT 저장</button>
+                            <button id="modalTranslateBtn" class="btn-action secondary">영어 자막 생성</button>
+                            <button class="btn-action" data-download-srt="corrected">보정 SRT 다운로드</button>
+                        </div>
                     </div>
-                    <div class="tab-content" data-content="meeting">
-                        <div class="summary-placeholder">요약 생성 버튼을 클릭하세요</div>
+                    <div class="tab-content" data-content="english_srt">
+                        <textarea id="modalEnSrt" class="workflow-srt" placeholder="영어 자막 생성 후 필요하면 수정하세요."></textarea>
+                        <div class="tab-action-row">
+                            <button id="saveEnglishSrtBtn" class="btn-toolbar">English SRT 저장</button>
+                            <button class="btn-action" data-download-srt="english">English SRT 다운로드</button>
+                        </div>
                     </div>
-                    <div class="tab-content" data-content="lecture">
-                        <div class="summary-placeholder">요약 생성 버튼을 클릭하세요</div>
+                    <div class="tab-content" data-content="audio_video">
+                        <div class="production-layout">
+                            <section class="production-main">
+                                <div class="production-section-header">
+                                    <p class="workflow-kicker">Create result</p>
+                                    <h3>무엇을 만들까요?</h3>
+                                </div>
+                                <div class="output-choice-grid">
+                                    <button id="previewStructureSubtitleBtn" class="output-choice-card" data-output-type="subtitle">
+                                        <span class="structure-label">MP4</span>
+                                        <strong>자막 영상</strong>
+                                        <small>선택 언어 자막을 영상에 입힙니다.</small>
+                                    </button>
+                                    <button id="modalAudioBtn" class="output-choice-card" data-output-type="audio">
+                                        <span class="structure-label">MP3</span>
+                                        <strong>음성 MP3</strong>
+                                        <small>SRT 타임라인에 맞춘 더빙 음성입니다.</small>
+                                    </button>
+                                    <button id="modalDubBtn" class="output-choice-card" data-output-type="dub">
+                                        <span class="structure-label">MP4</span>
+                                        <strong>더빙 영상</strong>
+                                        <small>생성 음성을 원본 영상에 합성합니다.</small>
+                                    </button>
+                                    <button id="modalCaptionedDubBtn" class="output-choice-card active" data-output-type="captioned_dub">
+                                        <span class="structure-label">MP4</span>
+                                        <strong>자막+더빙 영상</strong>
+                                        <small>자막과 더빙 음성을 함께 확인합니다.</small>
+                                    </button>
+                                </div>
+
+                                <section class="production-settings">
+                                    <div class="production-section-header">
+                                        <p class="workflow-kicker">Settings</p>
+                                        <h3 id="productionSettingsTitle">자막+더빙 영상 설정</h3>
+                                    </div>
+                                    <div class="generation-toolbar">
+                                        <div>
+                                            <label for="generationLanguageSelect">언어</label>
+                                            <select id="generationLanguageSelect" class="api-key-input">
+                                                <option value="ko">한국어</option>
+                                                <option value="en">English</option>
+                                            </select>
+                                        </div>
+                                        <div id="voiceSettingGroup">
+                                            <label for="generationVoiceSelect">더빙 음성</label>
+                                            <select id="generationVoiceSelect" class="api-key-input"></select>
+                                        </div>
+                                    </div>
+                                    <section id="subtitleStylePanel" class="subtitle-style-panel">
+                                        <div class="subtitle-style-header">
+                                            <strong>자막 디자인</strong>
+                                            <span>생성 전에 실제 표시 느낌을 확인하세요</span>
+                                        </div>
+                                        <div class="subtitle-style-grid">
+                                            <label>
+                                                <span>폰트</span>
+                                                <select id="subtitleFontFamily" class="api-key-input">
+                                                    <option value="Arial">Arial</option>
+                                                    <option value="Malgun Gothic">Malgun Gothic</option>
+                                                    <option value="Noto Sans CJK KR">Noto Sans CJK KR</option>
+                                                    <option value="NanumGothic">NanumGothic</option>
+                                                    <option value="Pretendard">Pretendard</option>
+                                                </select>
+                                            </label>
+                                            <label>
+                                                <span>크기</span>
+                                                <input id="subtitleFontSize" class="api-key-input" type="number" min="16" max="120" value="48">
+                                            </label>
+                                            <label>
+                                                <span>위치</span>
+                                                <select id="subtitlePosition" class="api-key-input">
+                                                    <option value="bottom">하단</option>
+                                                    <option value="middle">중앙</option>
+                                                    <option value="top">상단</option>
+                                                </select>
+                                            </label>
+                                            <label>
+                                                <span>여백</span>
+                                                <input id="subtitleMarginV" class="api-key-input" type="number" min="0" max="240" value="64">
+                                            </label>
+                                            <label>
+                                                <span>자막 색</span>
+                                                <input id="subtitleTextColor" class="subtitle-color-input" type="color" value="#ffffff">
+                                            </label>
+                                            <label>
+                                                <span>테두리 색</span>
+                                                <input id="subtitleOutlineColor" class="subtitle-color-input" type="color" value="#000000">
+                                            </label>
+                                            <label>
+                                                <span>테두리</span>
+                                                <input id="subtitleOutlineWidth" class="api-key-input" type="number" min="0" max="10" value="2">
+                                            </label>
+                                            <label>
+                                                <span>그림자</span>
+                                                <input id="subtitleShadow" class="api-key-input" type="number" min="0" max="8" value="1">
+                                            </label>
+                                            <label class="subtitle-toggle">
+                                                <input id="subtitleBackgroundEnabled" type="checkbox" checked>
+                                                <span>배경 사용</span>
+                                            </label>
+                                            <label>
+                                                <span>배경 색</span>
+                                                <input id="subtitleBackgroundColor" class="subtitle-color-input" type="color" value="#000000">
+                                            </label>
+                                            <label>
+                                                <span>배경 투명도</span>
+                                                <input id="subtitleBackgroundOpacity" class="api-key-input" type="range" min="0" max="100" value="60">
+                                            </label>
+                                        </div>
+                                        <div class="subtitle-design-preview" aria-label="자막 디자인 미리보기">
+                                            <div class="subtitle-preview-stage">
+                                                <div class="subtitle-preview-caption" id="subtitleDesignPreviewText">
+                                                    자막 디자인 미리보기
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </section>
+                                </section>
+                            </section>
+
+                            <aside class="production-preview production-controls-only">
+                                <div id="generationRequirementHint" class="production-hint">원본 영상이 없는 SRT 작업은 검은 배경 MP4로 생성됩니다.</div>
+                                <div class="production-actions">
+                                    <button id="productionGenerateBtn" class="btn-action primary">자막+더빙 영상 생성하기</button>
+                                    <a id="productionDownloadBtn" class="btn-action disabled-link" href="#" download>다운로드</a>
+                                </div>
+                            </aside>
+                        </div>
+
+                        <div class="legacy-preview-players hidden" aria-hidden="true">
+                            <span id="originalMediaHint"></span>
+                            <button id="previewKoSubtitleBtn" type="button"></button>
+                            <button id="previewEnSubtitleBtn" type="button"></button>
+                            <video id="originalVideoPlayer" controls playsinline></video>
+                            <video id="subtitleVideoPlayer" controls playsinline></video>
+                            <audio id="generatedAudioPlayer" controls></audio>
+                            <video id="dubbedVideoPlayer" controls playsinline></video>
+                            <video id="captionedDubVideoPlayer" controls playsinline></video>
+                            <strong id="mainPreviewTitle"></strong>
+                            <span id="mainPreviewHint"></span>
+                            <div id="mainPreviewEmpty"></div>
+                            <video id="mainPreviewVideo" controls playsinline></video>
+                            <audio id="mainPreviewAudio" controls></audio>
+                        </div>
                     </div>
-                    <div class="tab-content" data-content="youtube">
-                        <div class="summary-placeholder">요약 생성 버튼을 클릭하세요</div>
-                    </div>
-                    <div class="tab-content" data-content="conversation">
-                        <div class="summary-placeholder">요약 생성 버튼을 클릭하세요</div>
+                    <div class="tab-content" data-content="artifacts">
+                        <div id="modalArtifacts" class="artifact-list"></div>
                     </div>
                 </div>
-                
-                <div class="modal-footer">
-                    <button id="modalDownloadBtn" class="btn-action">📥 다운로드</button>
-                    <button id="modalSummarizeBtn" class="btn-action primary">✨ 요약 생성</button>
-                    <button id="modalDeleteSummaryBtn" class="btn-action warning">🗑️ 요약 삭제</button>
+
+                <div class="modal-footer modal-footer-split">
+                    <div id="modalJobStatus" class="api-key-status">대기 중</div>
                 </div>
             </div>
         </div>
     </div>
 
-    <script src="/static/script.js"></script>
+    <script src="/static/script.js?v=subtitle-preview-2"></script>
 </body>
 </html>

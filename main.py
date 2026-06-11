@@ -3,20 +3,33 @@ import uuid
 import json
 import asyncio
 import re
+import base64
+import subprocess
+import tempfile
+import wave
 from pathlib import Path
-from typing import Optional, List, Tuple
-from dotenv import load_dotenv
+from typing import Optional, List, Tuple, Dict
+from dotenv import load_dotenv, set_key
 from pydantic import BaseModel
 
 import whisper
 import torch
 import numpy as np
 import database as db
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydub import AudioSegment, effects, silence
-import google.generativeai as genai
+try:
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
+except Exception:
+    google_genai = None
+    google_genai_types = None
+try:
+    from google.cloud import texttospeech as cloud_texttospeech
+except Exception:
+    cloud_texttospeech = None
 
 import sys
 print("실행 파이썬:", sys.executable)
@@ -68,6 +81,52 @@ def format_srt_entry(index: int, start_seconds: float, end_seconds: float, text:
 class ApiKeyRequest(BaseModel):
     api_key: str
 
+class SubtitleStyleRequest(BaseModel):
+    font_family: str = "Arial"
+    font_size: int = 48
+    position: str = "bottom"
+    text_color: str = "#FFFFFF"
+    background_color: str = "#000000"
+    background_opacity: int = 60
+    background_enabled: bool = True
+    outline_color: str = "#000000"
+    outline_width: int = 2
+    shadow: int = 1
+    margin_v: int = 64
+
+
+class LanguageRequest(BaseModel):
+    language: str = "ko"
+    voice_name: Optional[str] = None
+    style_prompt: Optional[str] = None
+    srt_source: Optional[str] = None
+    subtitle_style: Optional[SubtitleStyleRequest] = None
+
+class EnglishSrtRequest(BaseModel):
+    english_srt_text: str
+
+class CorrectedSrtRequest(BaseModel):
+    corrected_srt_text: str
+
+class ScriptAudioRequest(BaseModel):
+    script: str
+    language: str = "ko"
+    filename: Optional[str] = None
+    voice_name: Optional[str] = None
+    style_prompt: Optional[str] = None
+
+class ScriptJobRequest(BaseModel):
+    filename: str
+    script: str
+    language: str = "ko"
+
+class JobRequest(BaseModel):
+    language: str = "ko"
+    voice_name: Optional[str] = None
+    style_prompt: Optional[str] = None
+    srt_source: Optional[str] = None
+    subtitle_style: Optional[SubtitleStyleRequest] = None
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -78,33 +137,120 @@ transcription_semaphore = asyncio.Semaphore(1)
 
 # Gemini API 설정 (사용자가 직접 입력)
 gemini_api_key = None
-gemini_model = None
+gemini_text_client = None
+gemini_tts_client = None
+GEMINI_PROVIDER = os.getenv("GEMINI_PROVIDER", "vertex_ai").lower()
+VERTEX_AI_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", os.getenv("VERTEX_AI_LOCATION", "global"))
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash" if GEMINI_PROVIDER in {"vertex_ai", "vertex"} else "gemini-3.5-flash")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "google_cloud").lower()
+
+
+def get_service_account_project_id() -> Optional[str]:
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not credentials_path:
+        return None
+    try:
+        credentials_data = json.loads(Path(credentials_path).read_text(encoding="utf-8"))
+        return credentials_data.get("project_id")
+    except Exception:
+        return None
+
+
+def get_google_cloud_project() -> Optional[str]:
+    return os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT_ID") or get_service_account_project_id()
+
 
 def set_gemini_api_key(api_key: str) -> bool:
     """Gemini API 키 설정"""
-    global gemini_api_key, gemini_model
+    global gemini_api_key, gemini_text_client, gemini_tts_client
     try:
-        genai.configure(api_key=api_key)
-        # gemini-2.0-flash: 최신 모델, 저렴하고 빠름 (무료 티어 10 RPM, 100만 토큰/분)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        # 간단한 테스트로 API 키 검증
-        test_response = model.generate_content("Hi")
-        
-        # 테스트 성공하면 전역 변수에 저장
-        gemini_model = model
+        if google_genai is None:
+            raise RuntimeError("google-genai package is not installed.")
+        client = google_genai.Client(api_key=api_key)
+        gemini_text_client = client
+        gemini_tts_client = client
         gemini_api_key = api_key
-        print("✓ Gemini API 연결 완료! (모델: gemini-2.0-flash-exp)")
+        try:
+            client.models.generate_content(model=GEMINI_TEXT_MODEL, contents="Hi")
+        except Exception as validation_error:
+            print(f"Gemini API validation warning: {validation_error}")
+        print(f"Gemini API connection complete. (model: {GEMINI_TEXT_MODEL})")
         return True
     except Exception as e:
         print(f"Gemini API 연결 실패: {e}")
-        gemini_model = None
+        gemini_text_client = None
+        gemini_tts_client = None
         gemini_api_key = None
         return False
+
+
+def persist_gemini_api_key(api_key: str) -> None:
+    env_path = Path(".env")
+    if not env_path.exists():
+        env_path.write_text("", encoding="utf-8")
+    set_key(str(env_path), "GEMINI_API_KEY", api_key)
+
+
+def initialize_gemini_vertex_client() -> bool:
+    global gemini_text_client, gemini_tts_client, gemini_api_key
+    try:
+        if google_genai is None:
+            raise RuntimeError("google-genai package is not installed.")
+        project = get_google_cloud_project()
+        if not project:
+            raise RuntimeError("GOOGLE_CLOUD_PROJECT or service account project_id is required for Vertex AI Gemini.")
+        client = google_genai.Client(
+            vertexai=True,
+            project=project,
+            location=VERTEX_AI_LOCATION,
+            http_options=google_genai_types.HttpOptions(apiVersion="v1") if google_genai_types else None,
+        )
+        gemini_text_client = client
+        gemini_tts_client = client
+        gemini_api_key = "vertex-ai"
+        try:
+            client.models.generate_content(model=GEMINI_TEXT_MODEL, contents="Hi")
+        except Exception as validation_error:
+            print(f"Vertex AI Gemini validation warning: {validation_error}")
+        print(f"Vertex AI Gemini connection complete. (project: {project}, location: {VERTEX_AI_LOCATION}, model: {GEMINI_TEXT_MODEL})")
+        return True
+    except Exception as e:
+        print(f"Vertex AI Gemini connection failed: {e}")
+        gemini_text_client = None
+        gemini_tts_client = None
+        gemini_api_key = None
+        return False
+
+
+def initialize_gemini_from_env() -> None:
+    if GEMINI_PROVIDER in {"vertex_ai", "vertex", "google_cloud"}:
+        initialize_gemini_vertex_client()
+        return
+    env_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if env_api_key:
+        set_gemini_api_key(env_api_key)
+
+
+def generate_gemini_text(prompt: str) -> str:
+    response = gemini_text_client.models.generate_content(
+        model=GEMINI_TEXT_MODEL,
+        contents=prompt,
+    )
+    return getattr(response, "text", "") or ""
+
+
+initialize_gemini_from_env()
 
 # 디렉토리 생성
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+MEDIA_DIR = Path("media")
+MEDIA_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+THUMBNAIL_DIR = Path("thumbnails")
+THUMBNAIL_DIR.mkdir(exist_ok=True)
 
 # 정적 파일 서빙
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -134,6 +280,10 @@ print("Whisper 모델 로드 완료!")
 TARGET_AUDIO_DBFS = -20.0
 MAX_AUDIO_GAIN_DB = 18.0
 MAX_TRANSCRIBE_CHUNK_MS = int(os.getenv("MAX_TRANSCRIBE_CHUNK_MS", str(3 * 60 * 1000)))
+TTS_GROUP_MAX_CHARS = int(os.getenv("TTS_GROUP_MAX_CHARS", "1800"))
+TTS_GROUP_MAX_DURATION_MS = int(os.getenv("TTS_GROUP_MAX_DURATION_MS", "45000"))
+TTS_GROUP_MAX_GAP_MS = int(os.getenv("TTS_GROUP_MAX_GAP_MS", "2000"))
+TTS_SYNC_MODE = os.getenv("TTS_SYNC_MODE", "cue").lower()
 MIN_TRANSCRIBE_CHUNK_MS = 700
 MIN_SILENCE_LEN_MS = 700
 KEEP_SILENCE_MS = 250
@@ -403,7 +553,7 @@ async def transcribe_audio_async_generator(audio_path: str, language: str = "ko"
 
 async def summarize_with_gemini(text: str, summary_type: str = "general") -> Optional[str]:
     """Gemini API로 텍스트를 요약합니다."""
-    if not gemini_model or not gemini_api_key:
+    if not gemini_text_client or not gemini_api_key:
         return "⚠ Gemini API 키가 설정되지 않았습니다. 설정에서 API 키를 입력해주세요."
     
     try:
@@ -494,12 +644,844 @@ async def summarize_with_gemini(text: str, summary_type: str = "general") -> Opt
         prompt = prompts.get(summary_type, prompts["general"])
         
         # Gemini API 호출
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
-        return response.text
+        return await asyncio.to_thread(generate_gemini_text, prompt)
         
     except Exception as e:
         print(f"Gemini 요약 오류: {e}")
         return f"요약 생성 중 오류가 발생했습니다: {str(e)}"
+
+
+SRT_TIME_RE = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})"
+)
+
+TTS_VOICES = [
+    {"name": "Kore", "label": "Kore - Firm", "default_ko": True},
+    {"name": "Puck", "label": "Puck - Upbeat", "default_en": True},
+    {"name": "Zephyr", "label": "Zephyr - Bright"},
+    {"name": "Charon", "label": "Charon - Informative"},
+    {"name": "Fenrir", "label": "Fenrir - Excitable"},
+    {"name": "Leda", "label": "Leda - Youthful"},
+    {"name": "Orus", "label": "Orus - Firm"},
+    {"name": "Aoede", "label": "Aoede - Breezy"},
+    {"name": "Callirrhoe", "label": "Callirrhoe - Easy-going"},
+    {"name": "Autonoe", "label": "Autonoe - Bright"},
+    {"name": "Enceladus", "label": "Enceladus - Breathy"},
+    {"name": "Iapetus", "label": "Iapetus - Clear"},
+    {"name": "Umbriel", "label": "Umbriel - Easy-going"},
+    {"name": "Algieba", "label": "Algieba - Smooth"},
+    {"name": "Despina", "label": "Despina - Smooth"},
+    {"name": "Erinome", "label": "Erinome - Clear"},
+    {"name": "Algenib", "label": "Algenib - Gravelly"},
+    {"name": "Rasalgethi", "label": "Rasalgethi - Informative"},
+    {"name": "Laomedeia", "label": "Laomedeia - Upbeat"},
+    {"name": "Achernar", "label": "Achernar - Soft"},
+    {"name": "Alnilam", "label": "Alnilam - Firm"},
+    {"name": "Schedar", "label": "Schedar - Even"},
+    {"name": "Gacrux", "label": "Gacrux - Mature"},
+    {"name": "Pulcherrima", "label": "Pulcherrima - Forward"},
+    {"name": "Achird", "label": "Achird - Friendly"},
+    {"name": "Zubenelgenubi", "label": "Zubenelgenubi - Casual"},
+    {"name": "Vindemiatrix", "label": "Vindemiatrix - Gentle"},
+    {"name": "Sadachbia", "label": "Sadachbia - Lively"},
+    {"name": "Sadaltager", "label": "Sadaltager - Knowledgeable"},
+    {"name": "Sulafat", "label": "Sulafat - Warm"},
+]
+
+CLOUD_TTS_VOICES = [
+    {"name": "ko-KR-Neural2-A", "label": "ko-KR-Neural2-A", "default_ko": True, "language_code": "ko-KR"},
+    {"name": "ko-KR-Neural2-B", "label": "ko-KR-Neural2-B", "language_code": "ko-KR"},
+    {"name": "ko-KR-Neural2-C", "label": "ko-KR-Neural2-C", "language_code": "ko-KR"},
+    {"name": "en-US-Neural2-D", "label": "en-US-Neural2-D", "default_en": True, "language_code": "en-US"},
+    {"name": "en-US-Neural2-A", "label": "en-US-Neural2-A", "language_code": "en-US"},
+    {"name": "en-US-Neural2-C", "label": "en-US-Neural2-C", "language_code": "en-US"},
+    {"name": "en-US-Neural2-E", "label": "en-US-Neural2-E", "language_code": "en-US"},
+    {"name": "en-US-Neural2-F", "label": "en-US-Neural2-F", "language_code": "en-US"},
+]
+
+
+def active_tts_provider() -> str:
+    return "gemini" if TTS_PROVIDER in {"gemini", "gemini_api"} else "google_cloud"
+
+
+def get_active_tts_voices() -> List[Dict]:
+    return TTS_VOICES if active_tts_provider() == "gemini" else CLOUD_TTS_VOICES
+
+
+def default_voice_for_language(language: str) -> str:
+    language = (language or "ko").lower()
+    voices = get_active_tts_voices()
+    default_key = "default_ko" if language == "ko" else "default_en"
+    for voice in voices:
+        if voice.get(default_key):
+            return voice["name"]
+    return voices[0]["name"]
+
+
+def parse_srt_timecode(value: str) -> float:
+    hours, minutes, rest = value.split(":")
+    seconds, milliseconds = rest.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(milliseconds) / 1000
+
+
+def parse_srt(srt_text: str) -> List[Dict]:
+    blocks = re.split(r"\n\s*\n", (srt_text or "").replace("\r\n", "\n").strip())
+    cues = []
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        time_match = SRT_TIME_RE.search(lines[1])
+        if not time_match:
+            continue
+        try:
+            index = int(lines[0])
+        except ValueError:
+            index = len(cues) + 1
+        cues.append({
+            "index": index,
+            "start_code": time_match.group("start"),
+            "end_code": time_match.group("end"),
+            "start": parse_srt_timecode(time_match.group("start")),
+            "end": parse_srt_timecode(time_match.group("end")),
+            "text": "\n".join(lines[2:]).strip(),
+        })
+    return cues
+
+
+def build_srt(cues: List[Dict], texts: List[str]) -> str:
+    entries = []
+    for cue, text in zip(cues, texts):
+        entries.append(f"{cue['index']}\n{cue['start_code']} --> {cue['end_code']}\n{text.strip()}")
+    return "\n\n".join(entries)
+
+
+def sanitize_output_name(filename: str) -> str:
+    stem = Path(filename or "output").stem
+    stem = re.sub(r"[^\w가-힣.-]+", "_", stem, flags=re.UNICODE).strip("._")
+    return stem or "output"
+
+
+def get_srt_for_language(file: Dict, language: str, srt_source: Optional[str] = None) -> str:
+    language = (language or "ko").lower()
+    if srt_source == "original":
+        return file.get("srt_text") or ""
+    if srt_source == "corrected":
+        return file.get("corrected_srt_text") or file.get("srt_text") or ""
+    if srt_source == "english":
+        return file.get("english_srt_text") or ""
+    if language == "en":
+        return file.get("english_srt_text") or ""
+    return file.get("corrected_srt_text") or file.get("srt_text") or ""
+
+
+def normalize_voice_name(language: str, voice_name: Optional[str]) -> str:
+    default_voice = default_voice_for_language(language)
+    if not voice_name:
+        return default_voice
+    valid_voice_names = {voice["name"] for voice in get_active_tts_voices()}
+    return voice_name if voice_name in valid_voice_names else default_voice
+
+
+def artifact_api_response(artifact: Dict) -> Dict:
+    metadata = artifact.get("metadata") or {}
+    return {
+        "success": True,
+        "artifact": artifact,
+        "artifact_id": artifact["id"],
+        "filename": artifact.get("filename", ""),
+        "duration_ms": metadata.get("duration_ms"),
+        "download_url": f"/api/artifacts/{artifact['id']}/download",
+    }
+
+
+def prepare_file_for_api(file: Dict, include_original: bool = False) -> Dict:
+    if file.get("thumbnail_path"):
+        file["thumbnail_url"] = f"/api/files/{file['id']}/thumbnail"
+    else:
+        file["thumbnail_url"] = None
+    media_path = Path(file.get("media_path") or "")
+    file["media_url"] = f"/api/files/{file['id']}/media" if media_path.exists() else None
+    if not include_original:
+        if len(file.get("original_text", "")) > 200:
+            file["text_preview"] = file["original_text"][:200] + "..."
+        else:
+            file["text_preview"] = file.get("original_text", "")
+        file.pop("original_text", None)
+    return file
+
+
+def require_gemini_ready():
+    if not gemini_text_client or not gemini_api_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is not configured.")
+
+
+def require_tts_ready():
+    if active_tts_provider() == "google_cloud":
+        if cloud_texttospeech is None:
+            raise HTTPException(status_code=500, detail="google-cloud-texttospeech package is not installed. Run pip install -r requirements.txt.")
+        return
+    require_gemini_ready()
+    if google_genai is None or google_genai_types is None:
+        raise HTTPException(status_code=500, detail="google-genai package is not installed. Run pip install -r requirements.txt.")
+    if gemini_tts_client is None:
+        raise HTTPException(status_code=400, detail="Gemini TTS client is not configured. Save the Gemini API key again.")
+
+
+async def translate_srt_to_english(srt_text: str) -> str:
+    require_gemini_ready()
+    cues = parse_srt(srt_text)
+    if not cues:
+        raise HTTPException(status_code=400, detail="No valid Korean SRT cues found.")
+    source_items = [{"index": cue["index"], "text": cue["text"]} for cue in cues]
+    prompt = (
+        "Translate the following Korean subtitle cue texts into natural English. "
+        "Return JSON only as an array of objects with index and text. "
+        "Do not add, remove, merge, split, or reorder items. Preserve line breaks only when useful.\n\n"
+        f"{json.dumps(source_items, ensure_ascii=False)}"
+    )
+    raw_text = (await asyncio.to_thread(generate_gemini_text, prompt)).strip()
+    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        translated_items = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Translation response was not valid JSON: {exc}")
+    translated_by_index = {
+        int(item.get("index")): str(item.get("text", "")).strip()
+        for item in translated_items
+        if isinstance(item, dict) and item.get("index") is not None
+    }
+    return build_srt(cues, [translated_by_index.get(cue["index"], cue["text"]) for cue in cues])
+
+
+def write_wave_file(path: Path, pcm: bytes, channels: int = 1, rate: int = 24000, sample_width: int = 2) -> None:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(rate)
+        wav_file.writeframes(pcm)
+
+
+def extract_tts_pcm(response) -> bytes:
+    part = response.candidates[0].content.parts[0]
+    inline_data = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
+    data = getattr(inline_data, "data", None)
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, str):
+        return base64.b64decode(data)
+    raise ValueError("Gemini TTS response did not include audio data.")
+
+
+async def generate_tts_wav(text: str, language: str, wav_path: Path, voice_name: Optional[str] = None, style_prompt: Optional[str] = None) -> None:
+    require_tts_ready()
+    language = (language or "ko").lower()
+    voice_name = normalize_voice_name(language, voice_name)
+    if active_tts_provider() == "google_cloud":
+        await generate_cloud_tts_wav(text, language, wav_path, voice_name)
+        return
+    await generate_gemini_tts_wav(text, language, wav_path, voice_name, style_prompt=style_prompt)
+
+
+async def generate_gemini_tts_wav(text: str, language: str, wav_path: Path, voice_name: str, style_prompt: Optional[str] = None) -> None:
+    prompt_language = "Korean" if language == "ko" else "English"
+    style = (style_prompt or "Read clearly at a steady narration pace.").strip()
+    prompt = f"{style}\nRead the following {prompt_language} text exactly:\n{text.strip()}"
+    response = await asyncio.to_thread(
+        gemini_tts_client.models.generate_content,
+        model=GEMINI_TTS_MODEL,
+        contents=prompt,
+        config=google_genai_types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=google_genai_types.SpeechConfig(
+                voice_config=google_genai_types.VoiceConfig(
+                    prebuilt_voice_config=google_genai_types.PrebuiltVoiceConfig(voice_name=voice_name)
+                )
+            ),
+        ),
+    )
+    write_wave_file(wav_path, extract_tts_pcm(response))
+
+
+def cloud_language_code(language: str) -> str:
+    return "ko-KR" if (language or "ko").lower() == "ko" else "en-US"
+
+
+async def generate_cloud_tts_wav(text: str, language: str, wav_path: Path, voice_name: str) -> None:
+    def synthesize() -> bytes:
+        client = cloud_texttospeech.TextToSpeechClient()
+        synthesis_input = cloud_texttospeech.SynthesisInput(text=text.strip())
+        voice = cloud_texttospeech.VoiceSelectionParams(
+            language_code=cloud_language_code(language),
+            name=voice_name,
+        )
+        audio_config = cloud_texttospeech.AudioConfig(
+            audio_encoding=cloud_texttospeech.AudioEncoding.LINEAR16,
+            speaking_rate=1.0,
+        )
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
+        return response.audio_content
+
+    wav_path.write_bytes(await asyncio.to_thread(synthesize))
+
+
+def fit_audio_to_duration(audio: AudioSegment, duration_ms: int) -> AudioSegment:
+    duration_ms = max(duration_ms, 250)
+    if len(audio) <= duration_ms:
+        audio = apply_short_fades(audio)
+        return audio + AudioSegment.silent(duration=duration_ms - len(audio))
+    speed = min(max(len(audio) / duration_ms, 1.01), 2.0)
+    try:
+        fitted = stretch_audio_with_ffmpeg(audio, speed)
+    except Exception:
+        fitted = audio
+    if len(fitted) > duration_ms:
+        fitted = fitted[:duration_ms]
+    fitted = apply_short_fades(fitted)
+    return fitted + AudioSegment.silent(duration=max(duration_ms - len(fitted), 0))
+
+
+def build_atempo_filter(speed: float) -> str:
+    speed = max(float(speed), 0.5)
+    parts = []
+    remaining = speed
+    while remaining > 2.0:
+        parts.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        parts.append("atempo=0.5")
+        remaining /= 0.5
+    parts.append(f"atempo={remaining:.6f}")
+    return ",".join(parts)
+
+
+def stretch_audio_with_ffmpeg(audio: AudioSegment, speed: float) -> AudioSegment:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = Path(temp_dir) / "input.wav"
+        output_path = Path(temp_dir) / "output.wav"
+        audio.export(input_path, format="wav")
+        command = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-filter:a", build_atempo_filter(speed),
+            "-vn",
+            str(output_path),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg atempo failed: {result.stderr[-1000:]}")
+        return AudioSegment.from_file(output_path, format="wav").set_channels(audio.channels)
+
+
+def apply_short_fades(audio: AudioSegment, fade_ms: int = 8) -> AudioSegment:
+    if len(audio) <= fade_ms * 2:
+        return audio
+    return audio.fade_in(fade_ms).fade_out(fade_ms)
+
+
+def build_tts_cue_groups(cues: List[Dict], max_chars: int = TTS_GROUP_MAX_CHARS, max_duration_ms: int = TTS_GROUP_MAX_DURATION_MS, max_gap_ms: int = TTS_GROUP_MAX_GAP_MS) -> List[List[Dict]]:
+    groups = []
+    current = []
+    current_chars = 0
+    for cue in cues:
+        if not cue.get("text", "").strip():
+            continue
+        cue_text_len = len(cue["text"].strip())
+        should_split = False
+        if current:
+            group_start_ms = int(current[0]["start"] * 1000)
+            new_end_ms = int(cue["end"] * 1000)
+            gap_ms = int((cue["start"] - current[-1]["end"]) * 1000)
+            should_split = (
+                current_chars + cue_text_len > max_chars
+                or new_end_ms - group_start_ms > max_duration_ms
+                or gap_ms > max_gap_ms
+            )
+        if should_split:
+            groups.append(current)
+            current = []
+            current_chars = 0
+        current.append(cue)
+        current_chars += cue_text_len
+    if current:
+        groups.append(current)
+    return groups
+
+
+def text_for_tts_group(group: List[Dict]) -> str:
+    return "\n".join(cue["text"].strip() for cue in group if cue.get("text", "").strip())
+
+
+def tts_groups_for_mode(cues: List[Dict]) -> List[List[Dict]]:
+    non_empty_cues = [cue for cue in cues if cue.get("text", "").strip()]
+    if TTS_SYNC_MODE == "grouped":
+        return build_tts_cue_groups(non_empty_cues)
+    return [[cue] for cue in non_empty_cues]
+
+
+async def synthesize_audio_from_srt(srt_text: str, language: str, output_path: Path, voice_name: Optional[str] = None, style_prompt: Optional[str] = None) -> Dict:
+    cues = parse_srt(srt_text)
+    if not cues:
+        raise HTTPException(status_code=400, detail="No valid SRT cues found.")
+    total_duration_ms = int(max(cue["end"] for cue in cues) * 1000)
+    timeline = AudioSegment.silent(duration=total_duration_ms).set_channels(2)
+    temp_paths = []
+    groups = tts_groups_for_mode(cues)
+    try:
+        for group in groups:
+            wav_path = OUTPUT_DIR / f"{uuid.uuid4()}.wav"
+            temp_paths.append(wav_path)
+            await generate_tts_wav(text_for_tts_group(group), language, wav_path, voice_name=voice_name, style_prompt=style_prompt)
+            with open(wav_path, "rb") as wav_file:
+                segment = AudioSegment.from_file(wav_file, format="wav").set_channels(2)
+            group_start_ms = int(group[0]["start"] * 1000)
+            group_duration_ms = int((group[-1]["end"] - group[0]["start"]) * 1000)
+            segment = fit_audio_to_duration(segment, group_duration_ms)
+            timeline = timeline.overlay(segment, position=group_start_ms)
+        with open(output_path, "wb") as mp3_file:
+            timeline.export(mp3_file, format="mp3", bitrate="192k")
+    finally:
+        for temp_path in temp_paths:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+    return {
+        "cue_count": len(cues),
+        "tts_request_count": len(groups),
+        "tts_sync_mode": "grouped" if TTS_SYNC_MODE == "grouped" else "cue",
+        "duration_ms": len(timeline),
+        "voice_name": normalize_voice_name(language, voice_name),
+        "style_prompt": style_prompt or "",
+    }
+
+
+async def synthesize_audio_from_text(script: str, language: str, output_path: Path, voice_name: Optional[str] = None, style_prompt: Optional[str] = None) -> Dict:
+    wav_path = OUTPUT_DIR / f"{uuid.uuid4()}.wav"
+    try:
+        await generate_tts_wav(script, language, wav_path, voice_name=voice_name, style_prompt=style_prompt)
+        with open(wav_path, "rb") as wav_file:
+            audio = AudioSegment.from_file(wav_file, format="wav")
+        with open(output_path, "wb") as mp3_file:
+            audio.export(mp3_file, format="mp3", bitrate="192k")
+        return {
+            "cue_count": 0,
+            "duration_ms": len(audio),
+            "voice_name": normalize_voice_name(language, voice_name),
+            "style_prompt": style_prompt or "",
+        }
+    finally:
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+
+
+async def synthesize_script_audio(script: str, language: str, output_path: Path, voice_name: Optional[str] = None, style_prompt: Optional[str] = None) -> Dict:
+    if parse_srt(script):
+        return await synthesize_audio_from_srt(script, language, output_path, voice_name=voice_name, style_prompt=style_prompt)
+    return await synthesize_audio_from_text(script, language, output_path, voice_name=voice_name, style_prompt=style_prompt)
+
+
+def mux_video_with_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
+    command = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-1000:]}")
+
+
+def media_type_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".mp4", ".m4v", ".mov"}:
+        return "video/mp4"
+    if suffix == ".webm":
+        return "video/webm"
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
+
+
+def clamp_int(value, minimum: int, maximum: int, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def ass_time(seconds: float) -> str:
+    seconds = max(float(seconds or 0), 0.0)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole_seconds = int(seconds % 60)
+    centiseconds = int(round((seconds - int(seconds)) * 100))
+    if centiseconds == 100:
+        whole_seconds += 1
+        centiseconds = 0
+    if whole_seconds == 60:
+        minutes += 1
+        whole_seconds = 0
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}"
+
+
+def ass_color(hex_color: str, opacity: int = 100) -> str:
+    color = (hex_color or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        color = "FFFFFF"
+    red = color[0:2]
+    green = color[2:4]
+    blue = color[4:6]
+    alpha = 255 - round(255 * max(0, min(100, int(opacity))) / 100)
+    return f"&H{alpha:02X}{blue}{green}{red}".upper()
+
+
+def ass_dialogue_text(text: str) -> str:
+    return (
+        (text or "")
+        .replace("{", "｛")
+        .replace("}", "｝")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", r"\N")
+        .strip()
+    )
+
+
+def normalize_subtitle_style(style: Optional[SubtitleStyleRequest]) -> Dict:
+    data = style.model_dump() if style else {}
+    font_family = re.sub(r"[,;\r\n]", "", str(data.get("font_family") or "Arial")).strip() or "Arial"
+    position = str(data.get("position") or "bottom").lower()
+    if position not in {"top", "middle", "bottom"}:
+        position = "bottom"
+    background_enabled = bool(data.get("background_enabled", True))
+    return {
+        "font_family": font_family[:80],
+        "font_size": clamp_int(data.get("font_size"), 16, 120, 48),
+        "position": position,
+        "text_color": data.get("text_color") or "#FFFFFF",
+        "background_color": data.get("background_color") or "#000000",
+        "background_opacity": clamp_int(data.get("background_opacity"), 0, 100, 60),
+        "background_enabled": background_enabled,
+        "outline_color": data.get("outline_color") or "#000000",
+        "outline_width": clamp_int(data.get("outline_width"), 0, 10, 2),
+        "shadow": clamp_int(data.get("shadow"), 0, 8, 1),
+        "margin_v": clamp_int(data.get("margin_v"), 0, 240, 64),
+    }
+
+
+def build_ass_subtitles(srt_text: str, style: Optional[SubtitleStyleRequest] = None) -> Tuple[str, Dict]:
+    cues = parse_srt(srt_text)
+    normalized = normalize_subtitle_style(style)
+    alignment = {"bottom": 2, "middle": 5, "top": 8}[normalized["position"]]
+    border_style = 3 if normalized["background_enabled"] else 1
+    back_opacity = normalized["background_opacity"] if normalized["background_enabled"] else 0
+    style_line = ",".join([
+        "Default",
+        normalized["font_family"],
+        str(normalized["font_size"]),
+        ass_color(normalized["text_color"], 100),
+        ass_color(normalized["text_color"], 100),
+        ass_color(normalized["outline_color"], 100),
+        ass_color(normalized["background_color"], back_opacity),
+        "-1", "0", "0", "0",
+        "100", "100", "0", "0",
+        str(border_style),
+        str(normalized["outline_width"]),
+        str(normalized["shadow"]),
+        str(alignment),
+        "80", "80", str(normalized["margin_v"]),
+        "1",
+    ])
+    dialogue_lines = [
+        f"Dialogue: 0,{ass_time(cue['start'])},{ass_time(cue['end'])},Default,,0,0,0,,{ass_dialogue_text(cue['text'])}"
+        for cue in cues
+    ]
+    ass_text = "\n".join([
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1920",
+        "PlayResY: 1080",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+        f"Style: {style_line}",
+        "",
+        "[Events]",
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+        *dialogue_lines,
+        "",
+    ])
+    return ass_text, normalized
+
+
+def burn_subtitles_into_video(source_video_path: Path, srt_text: str, output_path: Path, subtitle_style: Optional[SubtitleStyleRequest] = None) -> Dict:
+    temp_ass_path = OUTPUT_DIR / f"subtitle_{uuid.uuid4().hex}.ass"
+    try:
+        ass_text, normalized_style = build_ass_subtitles(srt_text, subtitle_style)
+        temp_ass_path.write_text(ass_text, encoding="utf-8")
+        subtitle_filter = f"subtitles={temp_ass_path.name}"
+        command = [
+            "ffmpeg", "-y",
+            "-i", str(source_video_path.resolve()),
+            "-vf", subtitle_filter,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "copy",
+            str(output_path.resolve()),
+        ]
+        result = subprocess.run(command, cwd=str(OUTPUT_DIR.resolve()), capture_output=True, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"subtitle video generation failed: {result.stderr[-1000:]}")
+        return normalized_style
+    finally:
+        try:
+            temp_ass_path.unlink()
+        except OSError:
+            pass
+
+
+async def create_subtitle_video_artifact_for_file(file: Dict, language: str, srt_source: Optional[str] = None, subtitle_style: Optional[SubtitleStyleRequest] = None) -> Dict:
+    language = (language or "ko").lower()
+    srt_text = get_srt_for_language(file, language, srt_source=srt_source)
+    if not srt_text:
+        raise HTTPException(status_code=400, detail=f"No {language} SRT is available.")
+
+    cues = parse_srt(srt_text)
+    duration_ms = int(max((cue["end"] for cue in cues), default=1.0) * 1000)
+    base_name = sanitize_output_name(file.get("filename", "subtitle_video"))
+    output_path = OUTPUT_DIR / f"{base_name}_{language}_subtitled_{uuid.uuid4().hex[:8]}.mp4"
+    media_path = Path(file.get("media_path") or "")
+    black_video_path = None
+    try:
+        if media_path.exists():
+            source_video_path = media_path
+            source_video = "original"
+        else:
+            black_video_path = OUTPUT_DIR / f"{base_name}_black_{uuid.uuid4().hex[:8]}.mp4"
+            await asyncio.to_thread(create_black_video, duration_ms, black_video_path)
+            source_video_path = black_video_path
+            source_video = "black"
+        normalized_style = await asyncio.to_thread(burn_subtitles_into_video, source_video_path, srt_text, output_path, subtitle_style)
+    finally:
+        if black_video_path:
+            try:
+                black_video_path.unlink()
+            except OSError:
+                pass
+
+    metadata = {
+        "duration_ms": duration_ms,
+        "srt_source": srt_source or ("english" if language == "en" else ("corrected" if file.get("corrected_srt_text") else "original")),
+        "source_video": source_video,
+        "variant": "subtitle",
+        "subtitle_style": normalized_style,
+    }
+    return db.create_artifact(file["id"], "subtitle_video", language, str(output_path), output_path.name, metadata)
+
+
+async def create_audio_artifact_for_file(file: Dict, language: str, voice_name: Optional[str] = None, style_prompt: Optional[str] = None, srt_source: Optional[str] = None) -> Dict:
+    language = (language or "ko").lower()
+    srt_text = get_srt_for_language(file, language, srt_source=srt_source)
+    if not srt_text:
+        raise HTTPException(status_code=400, detail=f"No {language} SRT is available.")
+    base_name = sanitize_output_name(file.get("filename", "audio"))
+    output_path = OUTPUT_DIR / f"{base_name}_{language}_{uuid.uuid4().hex[:8]}.mp3"
+    metadata = await synthesize_audio_from_srt(
+        srt_text,
+        language,
+        output_path,
+        voice_name=voice_name,
+        style_prompt=style_prompt,
+    )
+    metadata["srt_source"] = srt_source or ("english" if language == "en" else ("corrected" if file.get("corrected_srt_text") else "original"))
+    return db.create_artifact(file["id"], "audio", language, str(output_path), output_path.name, metadata)
+
+
+def desired_srt_source(file: Dict, language: str, srt_source: Optional[str]) -> str:
+    return srt_source or ("english" if language == "en" else ("corrected" if file.get("corrected_srt_text") else "original"))
+
+
+def find_reusable_audio_artifact(file: Dict, language: str, voice_name: Optional[str], srt_source: Optional[str]) -> Optional[Dict]:
+    language = (language or "ko").lower()
+    expected_voice = normalize_voice_name(language, voice_name)
+    expected_srt_source = desired_srt_source(file, language, srt_source)
+    expected_sync_mode = "grouped" if TTS_SYNC_MODE == "grouped" else "cue"
+    fallback = None
+    for artifact in db.get_artifacts_for_file(file["id"]):
+        if artifact.get("kind") != "audio" or artifact.get("language") != language:
+            continue
+        metadata = artifact.get("metadata") or {}
+        artifact_path = Path(artifact.get("path") or "")
+        if not artifact_path.exists():
+            continue
+        artifact_voice = metadata.get("voice_name") or normalize_voice_name(language, None)
+        artifact_srt_source = metadata.get("srt_source") or desired_srt_source(file, language, None)
+        artifact_sync_mode = metadata.get("tts_sync_mode") or "grouped"
+        if artifact_sync_mode != expected_sync_mode:
+            continue
+        if artifact_voice == expected_voice and artifact_srt_source == expected_srt_source:
+            return artifact
+        if fallback is None and artifact_srt_source == expected_srt_source:
+            fallback = artifact
+    return fallback
+
+
+async def create_video_artifact_for_file(file: Dict, language: str, voice_name: Optional[str] = None, style_prompt: Optional[str] = None, srt_source: Optional[str] = None) -> Dict:
+    language = (language or "ko").lower()
+    srt_text = get_srt_for_language(file, language, srt_source=srt_source)
+    if not srt_text:
+        raise HTTPException(status_code=400, detail=f"No {language} SRT is available.")
+    base_name = sanitize_output_name(file.get("filename", "video"))
+    video_output_path = OUTPUT_DIR / f"{base_name}_{language}_dubbed_{uuid.uuid4().hex[:8]}.mp4"
+    audio_artifact = find_reusable_audio_artifact(file, language, voice_name, srt_source)
+    reused_audio = audio_artifact is not None
+    if audio_artifact:
+        audio_path = Path(audio_artifact["path"])
+        metadata = dict(audio_artifact.get("metadata") or {})
+    else:
+        audio_artifact = await create_audio_artifact_for_file(
+            file,
+            language,
+            voice_name=voice_name,
+            style_prompt=style_prompt,
+            srt_source=srt_source,
+        )
+        audio_path = Path(audio_artifact["path"])
+        metadata = dict(audio_artifact.get("metadata") or {})
+    media_path = Path(file.get("media_path") or "")
+    black_video_path = None
+    if media_path.exists():
+        source_video_path = media_path
+    else:
+        black_video_path = OUTPUT_DIR / f"{base_name}_black_{uuid.uuid4().hex[:8]}.mp4"
+        await asyncio.to_thread(create_black_video, metadata["duration_ms"], black_video_path)
+        source_video_path = black_video_path
+    await asyncio.to_thread(mux_video_with_audio, source_video_path, audio_path, video_output_path)
+    if black_video_path:
+        try:
+            black_video_path.unlink()
+        except OSError:
+            pass
+    metadata["srt_source"] = desired_srt_source(file, language, srt_source)
+    metadata["source_video"] = "original" if media_path.exists() else "black"
+    metadata["audio_artifact_id"] = audio_artifact["id"]
+    metadata["reused_audio"] = reused_audio
+    return db.create_artifact(file["id"], "video", language, str(video_output_path), video_output_path.name, metadata)
+
+
+async def create_captioned_dub_video_artifact_for_file(
+    file: Dict,
+    language: str,
+    voice_name: Optional[str] = None,
+    style_prompt: Optional[str] = None,
+    srt_source: Optional[str] = None,
+    subtitle_style: Optional[SubtitleStyleRequest] = None,
+) -> Dict:
+    language = (language or "ko").lower()
+    srt_text = get_srt_for_language(file, language, srt_source=srt_source)
+    if not srt_text:
+        raise HTTPException(status_code=400, detail=f"No {language} SRT is available.")
+
+    base_name = sanitize_output_name(file.get("filename", "captioned_dub_video"))
+    dubbed_artifact = await create_video_artifact_for_file(
+        file,
+        language,
+        voice_name=voice_name,
+        style_prompt=style_prompt,
+        srt_source=srt_source,
+    )
+    output_path = OUTPUT_DIR / f"{base_name}_{language}_captioned_dub_{uuid.uuid4().hex[:8]}.mp4"
+    normalized_style = await asyncio.to_thread(
+        burn_subtitles_into_video,
+        Path(dubbed_artifact["path"]),
+        srt_text,
+        output_path,
+        subtitle_style,
+    )
+
+    metadata = dict(dubbed_artifact.get("metadata") or {})
+    metadata["srt_source"] = desired_srt_source(file, language, srt_source)
+    metadata["dubbed_video_artifact_id"] = dubbed_artifact["id"]
+    metadata["variant"] = "captioned_dub"
+    metadata["subtitle_style"] = normalized_style
+    return db.create_artifact(file["id"], "captioned_dub_video", language, str(output_path), output_path.name, metadata)
+
+
+def generate_video_thumbnail(video_path: Path, output_path: Path) -> bool:
+    command = [
+        "ffmpeg", "-y",
+        "-ss", "00:00:01",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", "scale=480:-1",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    return result.returncode == 0 and output_path.exists()
+
+
+def create_black_video(duration_ms: int, output_path: Path) -> None:
+    duration = max(duration_ms / 1000, 1.0)
+    command = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "color=c=black:s=1280x720:r=30",
+        "-t", f"{duration:.3f}",
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"black video generation failed: {result.stderr[-1000:]}")
+
+
+async def correct_korean_srt(srt_text: str) -> str:
+    require_gemini_ready()
+    cues = parse_srt(srt_text)
+    if not cues:
+        raise HTTPException(status_code=400, detail="No valid Korean SRT cues found.")
+    source_items = [{"index": cue["index"], "text": cue["text"]} for cue in cues]
+    prompt = (
+        "Correct Korean subtitle cue texts for typos, spacing, and obvious speech-to-text mistakes. "
+        "Return JSON only as an array of objects with index and text. "
+        "Do not translate. Do not add, remove, merge, split, or reorder items. "
+        "Preserve the intended meaning and technical terms.\n\n"
+        f"{json.dumps(source_items, ensure_ascii=False)}"
+    )
+    raw_text = (await asyncio.to_thread(generate_gemini_text, prompt)).strip()
+    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        corrected_items = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Correction response was not valid JSON: {exc}")
+    corrected_by_index = {
+        int(item.get("index")): str(item.get("text", "")).strip()
+        for item in corrected_items
+        if isinstance(item, dict) and item.get("index") is not None
+    }
+    return build_srt(cues, [corrected_by_index.get(cue["index"], cue["text"]) for cue in cues])
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -535,8 +1517,10 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
     
     # 고유한 파일명 생성
     unique_id = str(uuid.uuid4())
-    video_path = UPLOAD_DIR / f"{unique_id}.mp4"
+    file_suffix = Path(file.filename).suffix or ".bin"
+    video_path = MEDIA_DIR / f"{unique_id}{file_suffix}"
     audio_path = UPLOAD_DIR / f"{unique_id}.wav"
+    keep_media = False
     
     try:
         # 1. 파일 업로드 중
@@ -570,6 +1554,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             
         # 음성 파일인 경우 Whisper용 WAV로 바로 전처리
         elif is_audio:
+            keep_media = True
             yield await send_progress(f"{file_prefix}: 음성 파일 확인 완료", 30, "processing")
 
             yield await send_progress(f"{file_prefix}: 음성 전처리 중...", 40, "processing")
@@ -582,6 +1567,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             
             yield await send_progress(f"{file_prefix}: 음성 파일 준비 완료", 55, "processing")
         else:
+            keep_media = True
             # 영상 파일인 경우 오디오 추출
             # 4. 오디오 추출 준비
             yield await send_progress(f"{file_prefix}: 오디오 추출 준비 중...", 30, "processing")
@@ -646,13 +1632,21 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             file_type = "video"
         else:
             file_type = "audio"
+
+        thumbnail_path = ""
+        if file_type == "video" and keep_media:
+            candidate_thumbnail = THUMBNAIL_DIR / f"{unique_id}.jpg"
+            if await asyncio.to_thread(generate_video_thumbnail, video_path, candidate_thumbnail):
+                thumbnail_path = str(candidate_thumbnail)
         
         # DB에 저장
         file_record = db.create_file_record(
             filename=file.filename,
             file_type=file_type,
             original_text=text,
-            srt_text=srt_text
+            srt_text=srt_text,
+            media_path=str(video_path) if keep_media else "",
+            thumbnail_path=thumbnail_path,
         )
         file_id = file_record["id"]
         
@@ -668,7 +1662,11 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             "filename": file.filename,
             "text": text,
             "srt_text": srt_text,
-            "file_id": file_id  # 파일 ID 추가
+            "file_id": file_id,
+            "file_type": file_type,
+            "media_available": bool(keep_media),
+            "has_srt": bool(srt_text),
+            "thumbnail_url": f"/api/files/{file_id}/thumbnail" if thumbnail_path else None,
         }
         yield f"data: {json.dumps(result)}\n\n"
         
@@ -680,7 +1678,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
     finally:
         # 임시 파일 정리
         try:
-            if video_path.exists():
+            if video_path.exists() and not keep_media:
                 video_path.unlink()
             if audio_path.exists():
                 audio_path.unlink()
@@ -727,14 +1725,8 @@ async def get_all_files():
     """모든 파일 목록 조회"""
     try:
         files = db.get_all_files()
-        # 텍스트 길이 제한 (목록에서는 전체 텍스트 불필요)
         for file in files:
-            if len(file.get("original_text", "")) > 200:
-                file["text_preview"] = file["original_text"][:200] + "..."
-            else:
-                file["text_preview"] = file.get("original_text", "")
-            # 목록에서는 전체 텍스트 제거 (성능)
-            file.pop("original_text", None)
+            prepare_file_for_api(file, include_original=False)
         
         return {"success": True, "files": files}
     except Exception as e:
@@ -749,12 +1741,374 @@ async def get_file_detail(file_id: str):
         file = db.get_file_by_id(file_id)
         if not file:
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
-        return {"success": True, "file": file}
+        return {"success": True, "file": prepare_file_for_api(file, include_original=True)}
     except HTTPException:
         raise
     except Exception as e:
         print(f"파일 조회 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/translate/en")
+async def translate_file_to_english(file_id: str):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        if file.get("english_srt_text"):
+            return {"success": True, "english_srt_text": file["english_srt_text"], "cached": True}
+        english_srt_text = await translate_srt_to_english(file.get("corrected_srt_text") or file.get("srt_text") or "")
+        db.update_english_srt(file_id, english_srt_text)
+        return {"success": True, "english_srt_text": english_srt_text, "cached": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"English SRT translation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/files/{file_id}/english-srt")
+async def update_file_english_srt(file_id: str, request: EnglishSrtRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        english_srt_text = (request.english_srt_text or "").strip()
+        if not parse_srt(english_srt_text):
+            raise HTTPException(status_code=400, detail="English SRT must include valid SRT timecodes.")
+        db.update_english_srt(file_id, english_srt_text)
+        return {"success": True, "english_srt_text": english_srt_text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"English SRT update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/files/{file_id}/corrected-srt")
+async def update_file_corrected_srt(file_id: str, request: CorrectedSrtRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        corrected_srt_text = (request.corrected_srt_text or "").strip()
+        if not parse_srt(corrected_srt_text):
+            raise HTTPException(status_code=400, detail="Corrected SRT must include valid SRT timecodes.")
+        db.update_file_fields(file_id, corrected_srt_text=corrected_srt_text)
+        return {"success": True, "corrected_srt_text": corrected_srt_text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Corrected SRT update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/srt/correct/ko")
+async def correct_file_korean_srt(file_id: str):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        corrected_srt_text = await correct_korean_srt(file.get("srt_text") or "")
+        db.update_file_fields(file_id, corrected_srt_text=corrected_srt_text)
+        return {"success": True, "corrected_srt_text": corrected_srt_text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Korean SRT correction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/audio")
+async def create_file_audio(file_id: str, request: LanguageRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        artifact = await create_audio_artifact_for_file(
+            file,
+            request.language,
+            voice_name=request.voice_name,
+            style_prompt=request.style_prompt,
+            srt_source=request.srt_source,
+        )
+        return artifact_api_response(artifact)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Audio generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/dub-video")
+async def create_dubbed_video(file_id: str, request: LanguageRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        artifact = await create_video_artifact_for_file(
+            file,
+            request.language,
+            voice_name=request.voice_name,
+            style_prompt=request.style_prompt,
+            srt_source=request.srt_source,
+        )
+        return artifact_api_response(artifact)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Dubbed video generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/subtitle-video")
+async def create_subtitled_video(file_id: str, request: LanguageRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        artifact = await create_subtitle_video_artifact_for_file(
+            file,
+            request.language,
+            srt_source=request.srt_source,
+            subtitle_style=request.subtitle_style,
+        )
+        return artifact_api_response(artifact)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Subtitle video generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/{file_id}/captioned-dub-video")
+async def create_captioned_dubbed_video(file_id: str, request: LanguageRequest):
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+        artifact = await create_captioned_dub_video_artifact_for_file(
+            file,
+            request.language,
+            voice_name=request.voice_name,
+            style_prompt=request.style_prompt,
+            srt_source=request.srt_source,
+            subtitle_style=request.subtitle_style,
+        )
+        return artifact_api_response(artifact)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Captioned dubbed video generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/script/audio")
+async def create_script_audio(request: ScriptAudioRequest):
+    try:
+        script = (request.script or "").strip()
+        if not script:
+            raise HTTPException(status_code=400, detail="Script is empty.")
+        language = (request.language or "ko").lower()
+        base_name = sanitize_output_name(request.filename or "script_audio")
+        output_path = OUTPUT_DIR / f"{base_name}_{language}_{uuid.uuid4().hex[:8]}.mp3"
+        metadata = await synthesize_script_audio(
+            script,
+            language,
+            output_path,
+            voice_name=request.voice_name,
+            style_prompt=request.style_prompt,
+        )
+        artifact = db.create_artifact(None, "audio", language, str(output_path), output_path.name, metadata)
+        return artifact_api_response(artifact)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Script audio generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tts/voices")
+async def get_tts_voices():
+    voices = get_active_tts_voices()
+    return {
+        "success": True,
+        "provider": active_tts_provider(),
+        "voices": voices,
+        "defaults": {"ko": default_voice_for_language("ko"), "en": default_voice_for_language("en")},
+        "supports": {"single_speaker": True, "multi_speaker": False, "style_prompt": False},
+    }
+
+
+@app.get("/api/files/{file_id}/media")
+async def get_file_media(file_id: str):
+    file = db.get_file_by_id(file_id)
+    if not file or not file.get("media_path"):
+        raise HTTPException(status_code=404, detail="Media not found.")
+    path = Path(file["media_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Media file is missing.")
+    return FileResponse(path, media_type=media_type_for_path(path), filename=file.get("filename") or path.name)
+
+
+@app.get("/api/files/{file_id}/thumbnail")
+async def get_file_thumbnail(file_id: str):
+    file = db.get_file_by_id(file_id)
+    if not file or not file.get("thumbnail_path"):
+        raise HTTPException(status_code=404, detail="Thumbnail not found.")
+    path = Path(file["thumbnail_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail file is missing.")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/jobs")
+async def get_jobs():
+    return {"success": True, "jobs": db.get_jobs()}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = db.get_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"success": True, "job": job}
+
+
+async def run_file_job(job_id: str, file_id: str, job_type: str, metadata: Dict):
+    db.update_job(job_id, status="running", progress=5, message="작업 시작")
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found.")
+
+        result_artifact_id = None
+        if job_type == "correct_ko":
+            db.update_job(job_id, progress=25, message="Gemini로 한국어 SRT 보정 중")
+            corrected_srt_text = await correct_korean_srt(file.get("srt_text") or "")
+            db.update_file_fields(file_id, corrected_srt_text=corrected_srt_text)
+            db.update_job(job_id, status="completed", progress=100, message="한국어 SRT 보정 완료")
+            return
+
+        if job_type == "translate_en":
+            db.update_job(job_id, progress=25, message="Gemini로 영어 SRT 생성 중")
+            english_srt_text = await translate_srt_to_english(file.get("corrected_srt_text") or file.get("srt_text") or "")
+            db.update_english_srt(file_id, english_srt_text)
+            db.update_job(job_id, status="completed", progress=100, message="영어 SRT 생성 완료")
+            return
+
+        if job_type == "audio":
+            db.update_job(job_id, progress=20, message="SRT 타임라인에 맞춰 MP3 생성 중")
+            artifact = await create_audio_artifact_for_file(
+                file,
+                metadata.get("language", "ko"),
+                voice_name=metadata.get("voice_name"),
+                style_prompt=metadata.get("style_prompt"),
+                srt_source=metadata.get("srt_source"),
+            )
+            result_artifact_id = artifact["id"]
+            db.update_job(job_id, status="completed", progress=100, message="MP3 생성 완료", result_artifact_id=result_artifact_id)
+            return
+
+        if job_type == "dub_video":
+            db.update_job(job_id, progress=20, message="음성 생성 및 영상 합성 중")
+            artifact = await create_video_artifact_for_file(
+                file,
+                metadata.get("language", "ko"),
+                voice_name=metadata.get("voice_name"),
+                style_prompt=metadata.get("style_prompt"),
+                srt_source=metadata.get("srt_source"),
+            )
+            result_artifact_id = artifact["id"]
+            db.update_job(job_id, status="completed", progress=100, message="더빙 영상 생성 완료", result_artifact_id=result_artifact_id)
+            return
+
+        if job_type == "subtitle_video":
+            db.update_job(job_id, progress=20, message="자막 영상 생성 중")
+            artifact = await create_subtitle_video_artifact_for_file(
+                file,
+                metadata.get("language", "ko"),
+                srt_source=metadata.get("srt_source"),
+                subtitle_style=SubtitleStyleRequest(**metadata["subtitle_style"]) if metadata.get("subtitle_style") else None,
+            )
+            result_artifact_id = artifact["id"]
+            db.update_job(job_id, status="completed", progress=100, message="자막 영상 생성 완료", result_artifact_id=result_artifact_id)
+            return
+
+        if job_type == "captioned_dub_video":
+            db.update_job(job_id, progress=20, message="더빙 음성 생성 및 자막 합성 중")
+            artifact = await create_captioned_dub_video_artifact_for_file(
+                file,
+                metadata.get("language", "ko"),
+                voice_name=metadata.get("voice_name"),
+                style_prompt=metadata.get("style_prompt"),
+                srt_source=metadata.get("srt_source"),
+                subtitle_style=SubtitleStyleRequest(**metadata["subtitle_style"]) if metadata.get("subtitle_style") else None,
+            )
+            result_artifact_id = artifact["id"]
+            db.update_job(job_id, status="completed", progress=100, message="자막+더빙 영상 생성 완료", result_artifact_id=result_artifact_id)
+            return
+
+        raise HTTPException(status_code=400, detail="Unsupported job type.")
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        db.update_job(job_id, status="failed", progress=0, message="작업 실패", error=str(detail))
+
+
+@app.post("/api/files/{file_id}/jobs/{job_type}")
+async def start_file_job(file_id: str, job_type: str, request: JobRequest, background_tasks: BackgroundTasks):
+    allowed = {"correct_ko", "translate_en", "audio", "dub_video", "subtitle_video", "captioned_dub_video"}
+    if job_type not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported job type.")
+    if not db.get_file_by_id(file_id):
+        raise HTTPException(status_code=404, detail="File not found.")
+    metadata = request.model_dump()
+    job = db.create_job(file_id, job_type, metadata)
+    background_tasks.add_task(run_file_job, job["id"], file_id, job_type, metadata)
+    return {"success": True, "job": job}
+
+
+@app.post("/api/script/jobs")
+async def create_script_job(request: ScriptJobRequest):
+    script = (request.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="Script is empty.")
+    if not parse_srt(script):
+        raise HTTPException(status_code=400, detail="SRT-only jobs require valid SRT timecodes.")
+    language = (request.language or "ko").lower()
+    filename = request.filename.strip() if request.filename else "srt_project.srt"
+    if not Path(filename).suffix:
+        filename = f"{filename}.srt"
+    file = db.create_file_record(
+        filename=filename,
+        file_type="srt_project",
+        original_text=script,
+        srt_text=script if language != "en" else "",
+        english_srt_text=script if language == "en" else "",
+    )
+    return {"success": True, "file": prepare_file_for_api(db.get_file_by_id(file["id"]), include_original=True)}
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+async def download_artifact(artifact_id: str):
+    artifact = db.get_artifact_by_id(artifact_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    path = Path(artifact.get("path") or "")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Artifact file is missing.")
+    return FileResponse(path, filename=artifact.get("filename") or path.name)
+
+
+@app.get("/api/artifacts/{artifact_id}/preview")
+async def preview_artifact(artifact_id: str):
+    artifact = db.get_artifact_by_id(artifact_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    path = Path(artifact.get("path") or "")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Artifact file is missing.")
+    return FileResponse(path, media_type=media_type_for_path(path))
 
 
 @app.delete("/api/files/{file_id}/summary/{summary_type}")
@@ -831,13 +2185,8 @@ async def search_files_api(q: str):
     """파일 검색"""
     try:
         results = db.search_files(q)
-        # 텍스트 미리보기만 포함
         for file in results:
-            if len(file.get("original_text", "")) > 200:
-                file["text_preview"] = file["original_text"][:200] + "..."
-            else:
-                file["text_preview"] = file.get("original_text", "")
-            file.pop("original_text", None)
+            prepare_file_for_api(file, include_original=False)
         
         return {"success": True, "results": results}
     except Exception as e:
@@ -859,7 +2208,8 @@ async def set_api_key(request: ApiKeyRequest):
         success = set_gemini_api_key(api_key)
         
         if success:
-            return {"success": True, "message": "API 키가 성공적으로 설정되었습니다!"}
+            persist_gemini_api_key(api_key)
+            return {"success": True, "message": "API 키가 성공적으로 설정되었고 .env에 저장되었습니다!"}
         else:
             return {"success": False, "message": "API 키 검증에 실패했습니다. 올바른 키인지 확인해주세요."}
     except Exception as e:
@@ -870,10 +2220,16 @@ async def set_api_key(request: ApiKeyRequest):
 @app.get("/api/check-api-key")
 async def check_api_key():
     """API 키 설정 상태 확인"""
+    project = get_google_cloud_project()
+    is_vertex = GEMINI_PROVIDER in {"vertex_ai", "vertex", "google_cloud"}
     return {
         "success": True,
-        "has_key": gemini_api_key is not None,
-        "key_preview": f"{gemini_api_key[:10]}..." if gemini_api_key else None
+        "has_key": gemini_text_client is not None,
+        "key_preview": f"Vertex AI ({project})" if is_vertex and project else (f"{gemini_api_key[:10]}..." if gemini_api_key else None),
+        "provider": "vertex_ai" if is_vertex else "api_key",
+        "project": project,
+        "location": VERTEX_AI_LOCATION,
+        "model": GEMINI_TEXT_MODEL,
     }
 
 
