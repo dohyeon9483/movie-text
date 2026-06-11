@@ -405,7 +405,7 @@ function createFileProgressTracker(filename, trackerId) {
 }
 
 function handleProgressUpdate(data) {
-    const { message, progress, status, filename, text } = data;
+    const { message, progress, status, filename, text, srt_text } = data;
     
     if (message && message.includes('[')) {
         const match = message.match(/\[(\d+)\/\d+\]/);
@@ -418,11 +418,11 @@ function handleProgressUpdate(data) {
                 tracker.updateProgress(progress, message, status);
                 
                 if (status === 'completed' && text !== undefined) {
-                    completedResults.push({ filename, text });
+                    completedResults.push({ filename, text, srt_text: srt_text || '' });
                     
                     // 변환 완료 시 자동 다운로드 실행
                     setTimeout(() => {
-                        downloadSingleResult(filename, text);
+                        downloadSingleResult(filename, text, srt_text || '');
                     }, 500); // UI 업데이트 시간을 고려한 약간의 딜레이
                 }
             }
@@ -446,7 +446,7 @@ function showResults() {
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
-                    다운로드
+                    ${result.srt_text || transcriptTextToSrt(result.text || '') ? 'SRT 다운로드' : 'TXT 다운로드'}
                 </button>
             </div>
             <div class="result-text">${result.text || '(텍스트 없음)'}</div>
@@ -456,21 +456,61 @@ function showResults() {
         
         const downloadBtn = resultItem.querySelector('.btn-download-single');
         downloadBtn.addEventListener('click', () => {
-            downloadSingleResult(result.filename, result.text);
+            downloadSingleResult(result.filename, result.text, result.srt_text);
         });
     });
 }
 
-function downloadSingleResult(filename, text) {
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+function downloadSingleResult(filename, text, srtText = '') {
+    const fallbackSrt = srtText || transcriptTextToSrt(text || '');
+    const content = fallbackSrt || text || '';
+    const extension = fallbackSrt ? '.srt' : '.txt';
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = filename.replace(/\.[^/.]+$/, '') + '.txt';
+    a.download = filename.replace(/\.[^/.]+$/, '') + extension;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+}
+
+function transcriptTextToSrt(text) {
+    const matches = [...text.matchAll(/\[(\d{2}):(\d{2}):(\d{2})\]\s*\n([\s\S]*?)(?=\n\s*\n\[\d{2}:\d{2}:\d{2}\]|\s*$)/g)];
+    if (matches.length === 0) {
+        return '';
+    }
+
+    return matches.map((match, index) => {
+        const startSeconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        const next = matches[index + 1];
+        const nextStartSeconds = next
+            ? Number(next[1]) * 3600 + Number(next[2]) * 60 + Number(next[3])
+            : startSeconds + 3;
+        const endSeconds = Math.max(startSeconds + 1, nextStartSeconds - 0.1);
+        const subtitleText = match[4].trim();
+
+        return [
+            index + 1,
+            `${formatSrtTime(startSeconds)} --> ${formatSrtTime(endSeconds)}`,
+            subtitleText
+        ].join('\n');
+    }).join('\n\n');
+}
+
+function formatSrtTime(totalSeconds) {
+    const milliseconds = Math.floor((totalSeconds % 1) * 1000);
+    const wholeSeconds = Math.floor(totalSeconds);
+    const seconds = wholeSeconds % 60;
+    const minutes = Math.floor(wholeSeconds / 60) % 60;
+    const hours = Math.floor(wholeSeconds / 3600);
+
+    return [
+        String(hours).padStart(2, '0'),
+        String(minutes).padStart(2, '0'),
+        String(seconds).padStart(2, '0')
+    ].join(':') + `,${String(milliseconds).padStart(3, '0')}`;
 }
 
 downloadAllBtn.addEventListener('click', () => {
@@ -478,7 +518,7 @@ downloadAllBtn.addEventListener('click', () => {
     
     completedResults.forEach((result, index) => {
         setTimeout(() => {
-            downloadSingleResult(result.filename, result.text);
+            downloadSingleResult(result.filename, result.text, result.srt_text);
         }, index * 300);
     });
     
@@ -620,7 +660,7 @@ downloadSelectedBtn.addEventListener('click', async () => {
         return;
     }
     
-    if (!confirm(`선택한 ${checkboxes.length}개 파일의 원본 텍스트를 다운로드하시겠습니까?`)) {
+    if (!confirm(`선택한 ${checkboxes.length}개 파일을 다운로드하시겠습니까? SRT가 있으면 SRT로 다운로드됩니다.`)) {
         return;
     }
     
@@ -633,9 +673,11 @@ downloadSelectedBtn.addEventListener('click', async () => {
             const data = await response.json();
             
             if (data.success) {
-                const text = data.file.original_text;
-                const txtFilename = filename.replace(/\.[^/.]+$/, '') + '.txt';
-                downloadText(text, txtFilename);
+                const fallbackSrt = data.file.srt_text || transcriptTextToSrt(data.file.original_text || '');
+                const text = fallbackSrt || data.file.original_text;
+                const extension = fallbackSrt ? '.srt' : '.txt';
+                const downloadFilename = filename.replace(/\.[^/.]+$/, '') + extension;
+                downloadText(text, downloadFilename);
                 
                 // 다운로드 간격 (브라우저 제한 방지)
                 await new Promise(resolve => setTimeout(resolve, 300));
@@ -784,8 +826,9 @@ modalDownloadBtn.addEventListener('click', async () => {
             let filename = '';
             
             if (currentTab === 'original') {
-                text = file.original_text;
-                filename = file.filename.replace(/\.[^/.]+$/, '') + '.txt';
+                const fallbackSrt = file.srt_text || transcriptTextToSrt(file.original_text || '');
+                text = fallbackSrt || file.original_text;
+                filename = file.filename.replace(/\.[^/.]+$/, '') + (fallbackSrt ? '.srt' : '.txt');
             } else {
                 text = file.summaries[currentTab] || '';
                 filename = file.filename.replace(/\.[^/.]+$/, '') + `_${currentTab}.txt`;

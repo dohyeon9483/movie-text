@@ -1062,6 +1062,11 @@ header p {
     color: white;
 }
 
+.btn-action.secondary {
+    background: #2b6cb0;
+    color: white;
+}
+
 .btn-action.danger {
     background: #dc3545;
     color: white;

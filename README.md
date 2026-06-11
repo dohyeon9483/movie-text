@@ -208,10 +208,11 @@ movie-to-txt/
 - 환경 변수 PATH에 ffmpeg가 추가되었는지 확인
 
 ### 메모리 부족 오류
-- Whisper 모델을 더 작은 것으로 변경 (main.py의 `model = whisper.load_model("base")` → `"tiny"`)
+- 환경 변수 `WHISPER_MODEL`을 `turbo`, `small`, `base`, `tiny` 중 하나로 설정
 
 ### 음성 인식 정확도가 낮음
-- 더 큰 모델 사용: `"base"` → `"small"` 또는 `"medium"`
+- 기본값은 정확도 우선의 `large-v3`입니다
+- 속도나 메모리가 부담되면 환경 변수 `WHISPER_MODEL`을 `turbo`, `medium`, `small` 중 하나로 설정
 - 단, 더 많은 메모리와 처리 시간 필요
 
 ## 라이선스

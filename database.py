@@ -31,10 +31,16 @@ def init_db():
         file_type TEXT NOT NULL,
         uploaded_at TEXT NOT NULL,
         original_text TEXT NOT NULL,
+        srt_text TEXT DEFAULT '',
         summaries TEXT DEFAULT '{}',
         last_updated TEXT
     )
     ''')
+
+    cursor.execute("PRAGMA table_info(files)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    if "srt_text" not in columns:
+        cursor.execute("ALTER TABLE files ADD COLUMN srt_text TEXT DEFAULT ''")
     
     # 검색을 위한 인덱스 생성
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_filename ON files(filename)')
@@ -87,7 +93,7 @@ def migrate_from_json():
     except Exception as e:
         print(f"마이그레이션 오류: {e}")
 
-def create_file_record(filename: str, file_type: str, original_text: str) -> Dict:
+def create_file_record(filename: str, file_type: str, original_text: str, srt_text: str = "") -> Dict:
     """새 파일 레코드 생성"""
     file_id = str(uuid.uuid4())
     uploaded_at = datetime.now().isoformat()
@@ -97,9 +103,9 @@ def create_file_record(filename: str, file_type: str, original_text: str) -> Dic
     cursor = conn.cursor()
     
     cursor.execute('''
-    INSERT INTO files (id, filename, file_type, uploaded_at, original_text, summaries)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (file_id, filename, file_type, uploaded_at, original_text, json.dumps(summaries)))
+    INSERT INTO files (id, filename, file_type, uploaded_at, original_text, srt_text, summaries)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (file_id, filename, file_type, uploaded_at, original_text, srt_text, json.dumps(summaries)))
     
     conn.commit()
     conn.close()
@@ -110,6 +116,7 @@ def create_file_record(filename: str, file_type: str, original_text: str) -> Dic
         "type": file_type,
         "uploaded_at": uploaded_at,
         "original_text": original_text,
+        "srt_text": srt_text,
         "summaries": summaries
     }
 

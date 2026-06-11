@@ -1,20 +1,21 @@
 import os
-import tempfile
 import uuid
 import json
 import asyncio
+import re
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 import whisper
 import torch
+import numpy as np
 import database as db
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydub import AudioSegment
+from pydub import AudioSegment, effects, silence
 import google.generativeai as genai
 
 import sys
@@ -31,6 +32,38 @@ def format_time(seconds: float) -> str:
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_srt_time(seconds: float) -> str:
+    """Converts seconds to SRT timecode format: HH:MM:SS,mmm."""
+    if seconds is None:
+        seconds = 0
+    seconds = max(float(seconds), 0.0)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole_seconds = int(seconds % 60)
+    milliseconds = int(round((seconds - int(seconds)) * 1000))
+    if milliseconds == 1000:
+        whole_seconds += 1
+        milliseconds = 0
+    if whole_seconds == 60:
+        minutes += 1
+        whole_seconds = 0
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def format_srt_entry(index: int, start_seconds: float, end_seconds: float, text: str) -> str:
+    """Builds one SRT subtitle block."""
+    if end_seconds <= start_seconds:
+        end_seconds = start_seconds + 2.0
+    return (
+        f"{index}\n"
+        f"{format_srt_time(start_seconds)} --> {format_srt_time(end_seconds)}\n"
+        f"{text.strip()}"
+    )
 # Pydantic 모델
 class ApiKeyRequest(BaseModel):
     api_key: str
@@ -80,11 +113,182 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"사용 장치: {device}")
 
-# Whisper 모델 로드 (turbo 모델 사용 - 속도와 정확도의 최상의 균형)
-# 메모리가 부족하다면 'small' 또는 'base'로 변경하세요.
-print(f"Whisper 모델('turbo')을 {device}에 로드하는 중...")
-model = whisper.load_model("turbo", device=device)
+# Whisper 모델 로드
+# 기본값은 정확도가 높은 large-v3입니다.
+# 속도나 메모리가 부담되면 환경변수 WHISPER_MODEL=turbo 로 실행하세요.
+default_whisper_model = "large-v3"
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", default_whisper_model)
+print(f"Whisper 모델('{WHISPER_MODEL_NAME}')을 {device}에 로드하는 중...")
+try:
+    model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
+except Exception as e:
+    if WHISPER_MODEL_NAME == "turbo":
+        raise
+    print(f"Whisper 모델('{WHISPER_MODEL_NAME}') 로드 실패: {e}")
+    WHISPER_MODEL_NAME = "turbo"
+    print(f"Whisper 모델('{WHISPER_MODEL_NAME}')로 다시 시도합니다.")
+    model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
 print("Whisper 모델 로드 완료!")
+
+
+TARGET_AUDIO_DBFS = -20.0
+MAX_AUDIO_GAIN_DB = 18.0
+MAX_TRANSCRIBE_CHUNK_MS = int(os.getenv("MAX_TRANSCRIBE_CHUNK_MS", str(3 * 60 * 1000)))
+MIN_TRANSCRIBE_CHUNK_MS = 700
+MIN_SILENCE_LEN_MS = 700
+KEEP_SILENCE_MS = 250
+SILENCE_SEEK_STEP_MS = int(os.getenv("SILENCE_SEEK_STEP_MS", "100"))
+MERGE_SPEECH_GAP_MS = int(os.getenv("MERGE_SPEECH_GAP_MS", "2000"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+
+KOREAN_TRANSCRIPTION_PROMPT = (
+    "이것은 한국어 강의 또는 화면 녹화 음성입니다. "
+    "한국어 문장 부호와 띄어쓰기를 자연스럽게 정리해서 전사하세요. "
+    "영어 기술 용어는 들리는 그대로 유지하세요. "
+    "자주 나오는 용어: Python, Jupyter Notebook, Cursor, Selenium, Pandas, Excel, "
+    "API, Gemini, ChatGPT, VS Code, GUI, Tkinter, PyQt, batch file, pyinstaller, "
+    "웹 크롤링, 데이터프레임, 가상환경, 주피터 노트북, 모드랩스, Mode Labs. "
+    "명확히 들리지 않는 구간은 임의로 러시아어, 중국어, 아랍어 등 다른 언어로 쓰지 마세요."
+)
+
+UNWANTED_SCRIPT_RE = re.compile(
+    r"[\u00c0-\u024f\u0370-\u03ff\u0400-\u052f\u0590-\u08ff"
+    r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]"
+)
+MEANINGFUL_TEXT_RE = re.compile(r"[0-9A-Za-z가-힣]")
+
+
+def is_audio_silent(audio: AudioSegment) -> bool:
+    """실질적인 소리가 없는 오디오인지 확인합니다."""
+    return len(audio) == 0 or audio.rms == 0 or audio.dBFS == float("-inf")
+
+
+def preprocess_audio_for_whisper(audio: AudioSegment) -> AudioSegment:
+    """Whisper 입력에 맞게 음량, 채널, 샘플레이트, 대역을 정리합니다."""
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    if is_audio_silent(audio):
+        return audio
+
+    audio = audio.high_pass_filter(80).low_pass_filter(7600)
+    audio = effects.compress_dynamic_range(
+        audio,
+        threshold=-28.0,
+        ratio=2.5,
+        attack=5.0,
+        release=50.0,
+    )
+
+    if not is_audio_silent(audio):
+        gain = TARGET_AUDIO_DBFS - audio.dBFS
+        gain = max(min(gain, MAX_AUDIO_GAIN_DB), -MAX_AUDIO_GAIN_DB)
+        audio = audio.apply_gain(gain)
+
+    return effects.normalize(audio, headroom=1.0)
+
+
+def export_preprocessed_audio(input_path: str, output_path: str) -> None:
+    """영상/음성 파일을 Whisper용 WAV로 변환하고 전처리합니다."""
+    audio = AudioSegment.from_file(input_path)
+    audio = preprocess_audio_for_whisper(audio)
+    audio.export(output_path, format="wav")
+
+
+def audiosegment_to_whisper_array(audio: AudioSegment) -> np.ndarray:
+    """16kHz mono AudioSegment를 Whisper가 바로 읽을 수 있는 float32 배열로 변환합니다."""
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
+    return samples / 32768.0
+
+
+def get_silence_threshold(audio: AudioSegment) -> float:
+    """오디오 평균 음량을 기준으로 무음 판정 기준을 계산합니다."""
+    if is_audio_silent(audio):
+        return -50.0
+    return max(audio.dBFS - 14.0, -50.0)
+
+
+def merge_close_ranges(ranges: List[Tuple[int, int]], max_gap_ms: int) -> List[Tuple[int, int]]:
+    """서로 가까운 음성 구간을 합쳐 지나치게 잘게 쪼개지는 것을 막습니다."""
+    if not ranges:
+        return []
+
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start - prev_end <= max_gap_ms:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_transcription_ranges(audio: AudioSegment) -> List[Tuple[int, int]]:
+    """무음 구간을 제외하고 Whisper에 넣을 음성 구간 목록을 만듭니다."""
+    if is_audio_silent(audio):
+        return []
+
+    raw_ranges = silence.detect_nonsilent(
+        audio,
+        min_silence_len=MIN_SILENCE_LEN_MS,
+        silence_thresh=get_silence_threshold(audio),
+        seek_step=SILENCE_SEEK_STEP_MS,
+    )
+
+    if not raw_ranges:
+        raw_ranges = [[0, len(audio)]]
+
+    padded_ranges = []
+    for start, end in raw_ranges:
+        start = max(0, start - KEEP_SILENCE_MS)
+        end = min(len(audio), end + KEEP_SILENCE_MS)
+        if end - start >= MIN_TRANSCRIBE_CHUNK_MS:
+            padded_ranges.append((start, end))
+
+    merged_ranges = merge_close_ranges(padded_ranges, max_gap_ms=MERGE_SPEECH_GAP_MS)
+    transcription_ranges = []
+    for start, end in merged_ranges:
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + MAX_TRANSCRIBE_CHUNK_MS, end)
+            if chunk_end - cursor >= MIN_TRANSCRIBE_CHUNK_MS:
+                transcription_ranges.append((cursor, chunk_end))
+            cursor = chunk_end
+
+    return transcription_ranges
+
+
+def clean_transcript_text(text: str) -> str:
+    """한국어 강의 결과에 섞인 비정상 외국어 문자 조각을 정리합니다."""
+    text = text.replace("\ufffd", "")
+    text = UNWANTED_SCRIPT_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    return text.strip()
+
+
+def should_skip_segment(segment: dict, text: str) -> bool:
+    """Whisper가 낮은 확신도로 만든 환각 가능성이 큰 세그먼트를 제외합니다."""
+    compact_text = re.sub(r"\s+", "", text)
+    if not compact_text:
+        return True
+
+    unwanted_count = len(UNWANTED_SCRIPT_RE.findall(text)) + text.count("\ufffd")
+    unwanted_ratio = unwanted_count / max(len(compact_text), 1)
+    avg_logprob = segment.get("avg_logprob")
+    no_speech_prob = segment.get("no_speech_prob") or 0.0
+    compression_ratio = segment.get("compression_ratio")
+
+    if no_speech_prob > 0.85:
+        return True
+    if avg_logprob is not None and avg_logprob < -1.0 and no_speech_prob > 0.35:
+        return True
+    if compression_ratio is not None and compression_ratio > 2.6:
+        return True
+    if unwanted_ratio > 0.35:
+        return True
+
+    cleaned_text = clean_transcript_text(text)
+    return not MEANINGFUL_TEXT_RE.search(cleaned_text)
 
 
 async def send_progress(message: str, progress: int, status: str = "processing"):
@@ -101,14 +305,7 @@ async def extract_audio_from_video_async(video_path: str, audio_path: str) -> bo
     """영상/음성 파일에서 Whisper 최적화 오디오(16kHz, Mono)를 추출합니다 (비동기 스레드 실행)."""
     def _extract():
         try:
-            # pydub을 사용하여 오디오 추출 및 전처리
-            audio = AudioSegment.from_file(video_path)
-            
-            # Whisper 최적화: 16,000Hz, Mono 채널 설정
-            audio = audio.set_frame_rate(16000).set_channels(1)
-            
-            # WAV 형식으로 저장
-            audio.export(audio_path, format="wav")
+            export_preprocessed_audio(video_path, audio_path)
             return True
         except Exception as e:
             print(f"오디오 전처리 오류: {e}")
@@ -118,69 +315,86 @@ async def extract_audio_from_video_async(video_path: str, audio_path: str) -> bo
 
 
 async def transcribe_audio_async_generator(audio_path: str, language: str = "ko"):
-    """Whisper를 사용하여 오디오를 텍스트로 변환합니다. 긴 오디오는 3분 단위로 분할하여 처리하고, 각 구간에 타임스탬프를 추가합니다."""
+    """Whisper를 사용하여 오디오를 텍스트로 변환합니다. 무음 구간을 제외하고 각 구간에 타임스탬프를 추가합니다."""
     async with transcription_semaphore:
         try:
-            # initial_prompt: 한국어 문장 부호와 정확도를 높이기 위한 힌트
-            initial_prompt = "이것은 한국어 음성 녹음 파일입니다. 정확한 문장 부호와 띄어쓰기를 사용하여 텍스트로 변환해주세요."
-            
             # pydub을 사용하여 오디오 파일 로드 (비동기)
             audio = await asyncio.to_thread(AudioSegment.from_file, audio_path)
-            
-            # 3분(180,000ms) 단위로 청크 분할
-            chunk_length_ms = 3 * 60 * 1000
-            chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+            chunks = build_transcription_ranges(audio)
+            if not chunks:
+                yield {"type": "result", "text": ""}
+                return
             
             full_text_with_timestamps = [] # 타임스탬프가 포함된 전체 텍스트를 저장할 리스트
+            srt_entries = []
+            skipped_segments = 0
+            decode_options = {}
+            if WHISPER_BEAM_SIZE > 1:
+                decode_options["beam_size"] = WHISPER_BEAM_SIZE
             
-            for i, chunk in enumerate(chunks):
+            for i, (chunk_start_ms, chunk_end_ms) in enumerate(chunks):
                 # 진행 상황 전달
                 yield {"type": "progress", "current": i + 1, "total": len(chunks)}
-                
-                # 임시 파일로 청크 저장
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_chunk:
-                    chunk_path = temp_chunk.name
-                
-                try:
-                    # export 비동기 처리
-                    await asyncio.to_thread(chunk.export, chunk_path, format="wav")
-                    
-                    # asyncio.to_thread를 사용하여 CPU 집약적인 작업을 별도 스레드에서 실행
-                    # condition_on_previous_text=False 와 compression_ratio_threshold 등을 통해 환각(Hallucination) 방지
-                    result = await asyncio.to_thread(
-                        model.transcribe,
-                        chunk_path, 
-                        language=language, 
-                        fp16=(device == "cuda"), 
-                        verbose=False,
-                        initial_prompt=initial_prompt,
-                        condition_on_previous_text=False,
-                        compression_ratio_threshold=1.35, # 반복되는 문장 필터링
-                        no_speech_threshold=0.6 # 의미 없는 소리를 외국어로 인식하는 것 방지
-                    )
-                    
-                    # 결과에서 segments를 추출하여 타임스탬프와 함께 포맷팅
-                    chunk_offset_seconds = i * (chunk_length_ms / 1000.0) # 현재 청크의 시작 시간 (초)
-                    
-                    for segment in result.get("segments", []):
-                        segment_text = segment.get("text", "").strip()
-                        if segment_text:
-                            # 청크 오프셋을 현재 세그먼트의 시작/끝 시간에 더함
-                            absolute_start_time = chunk_offset_seconds + segment.get("start", 0)
-                            absolute_end_time = chunk_offset_seconds + segment.get("end", 0)
-                            
-                            formatted_timestamp = format_time(absolute_start_time)
-                            full_text_with_timestamps.append(
-                            f"[{formatted_timestamp}]\n{segment_text}"  
+
+                chunk = audio[chunk_start_ms:chunk_end_ms]
+                chunk_samples = audiosegment_to_whisper_array(chunk)
+
+                # asyncio.to_thread를 사용하여 CPU/GPU 작업을 별도 스레드에서 실행
+                result = await asyncio.to_thread(
+                    model.transcribe,
+                    chunk_samples,
+                    language=language,
+                    fp16=(device == "cuda"),
+                    verbose=False,
+                    initial_prompt=KOREAN_TRANSCRIPTION_PROMPT,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=2.4,
+                    logprob_threshold=-1.0,
+                    no_speech_threshold=0.55,
+                    hallucination_silence_threshold=2.0,
+                    **decode_options,
+                )
+
+                # 결과에서 segments를 추출하여 타임스탬프와 함께 포맷팅
+                chunk_offset_seconds = chunk_start_ms / 1000.0
+
+                for segment in result.get("segments", []):
+                    raw_segment_text = segment.get("text", "").strip()
+                    if should_skip_segment(segment, raw_segment_text):
+                        skipped_segments += 1
+                        continue
+
+                    segment_text = clean_transcript_text(raw_segment_text)
+                    if segment_text:
+                        # 청크 오프셋을 현재 세그먼트의 시작/끝 시간에 더함
+                        absolute_start_time = chunk_offset_seconds + segment.get("start", 0)
+                        absolute_end_time = chunk_offset_seconds + segment.get("end", 0)
+
+                        formatted_timestamp = format_time(absolute_start_time)
+                        if full_text_with_timestamps and full_text_with_timestamps[-1].endswith(f"\n{segment_text}"):
+                            continue
+                        full_text_with_timestamps.append(
+                            f"[{formatted_timestamp}]\n{segment_text}"
+                        )
+                        srt_entries.append(
+                            format_srt_entry(
+                                len(srt_entries) + 1,
+                                absolute_start_time,
+                                absolute_end_time,
+                                segment_text,
                             )
-                            
-                finally:
-                    # 임시 파일 삭제
-                    if os.path.exists(chunk_path):
-                        os.unlink(chunk_path)
+                        )
+
+            if skipped_segments:
+                print(f"음성 인식 후처리: 낮은 품질 세그먼트 {skipped_segments}개 제외")
                         
             # 최종 결과로 타임스탬프가 포함된 텍스트를 반환
-            yield {"type": "result", "text": "\n\n".join(full_text_with_timestamps)}
+            yield {
+                "type": "result",
+                "text": "\n\n".join(full_text_with_timestamps),
+                "srt_text": "\n\n".join(srt_entries),
+            }
             
         except Exception as e:
             print(f"음성 인식 오류: {e}")
@@ -354,25 +568,17 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             yield await send_progress(f"{file_prefix}: 텍스트 읽기 완료", 90, "processing")
             print(f"텍스트 파일 읽기 완료! 텍스트 길이: {len(text)}")
             
-        # 음성 파일인 경우 오디오 추출 건너뛰기
+        # 음성 파일인 경우 Whisper용 WAV로 바로 전처리
         elif is_audio:
-            # 음성 파일은 그대로 사용
             yield await send_progress(f"{file_prefix}: 음성 파일 확인 완료", 30, "processing")
-            
-            # WAV 형식이 아니면 변환
-            if not filename_lower.endswith('.wav'):
-                yield await send_progress(f"{file_prefix}: 음성 형식 변환 중...", 40, "processing")
-                try:
-                    audio = await asyncio.to_thread(AudioSegment.from_file, video_path)
-                    await asyncio.to_thread(audio.export, audio_path, format="wav")
-                except Exception as e:
-                    print(f"음성 형식 변환 오류: {e}")
-                    yield await send_progress(f"{file_prefix}: 음성 형식 변환 실패", 0, "error")
-                    return
-            else:
-                # 이미 WAV 파일이면 그대로 사용
-                import shutil
-                await asyncio.to_thread(shutil.copy, video_path, audio_path)
+
+            yield await send_progress(f"{file_prefix}: 음성 전처리 중...", 40, "processing")
+            try:
+                await asyncio.to_thread(export_preprocessed_audio, str(video_path), str(audio_path))
+            except Exception as e:
+                print(f"음성 전처리 오류: {e}")
+                yield await send_progress(f"{file_prefix}: 음성 전처리 실패", 0, "error")
+                return
             
             yield await send_progress(f"{file_prefix}: 음성 파일 준비 완료", 55, "processing")
         else:
@@ -392,6 +598,8 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             yield await send_progress(f"{file_prefix}: 오디오 추출 완료", 55, "processing")
             print("오디오 추출 완료!")
         
+        srt_text = ""
+
         # 텍스트 파일이 아닌 경우만 음성 인식 수행
         if not is_text:
             # 7. 음성 인식 준비
@@ -402,7 +610,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             yield await send_progress(f"{file_prefix}: 음성 인식 시작 (대기 중일 수 있습니다)", 65, "processing")
             print(f"음성 인식 시작: {file.filename}")
             
-            # 비동기로 음성 인식 실행 (세마포어 적용됨) - 3분 단위로 분할 처리
+            # 비동기로 음성 인식 실행 (세마포어 적용됨) - 무음 제외 구간 단위로 분할 처리
             text = None
             async for status in transcribe_audio_async_generator(str(audio_path), language="ko"):
                 if status["type"] == "progress":
@@ -413,6 +621,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
                     yield await send_progress(f"{file_prefix}: 음성 인식 중... ({current}/{total} 구간)", prog, "processing")
                 elif status["type"] == "result":
                     text = status["text"]
+                    srt_text = status.get("srt_text", "")
                 elif status["type"] == "error":
                     yield await send_progress(f"{file_prefix}: 음성 인식 실패 - {status['error']}", 0, "error")
                     return
@@ -442,7 +651,8 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
         file_record = db.create_file_record(
             filename=file.filename,
             file_type=file_type,
-            original_text=text
+            original_text=text,
+            srt_text=srt_text
         )
         file_id = file_record["id"]
         
@@ -457,6 +667,7 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             "status": "completed",
             "filename": file.filename,
             "text": text,
+            "srt_text": srt_text,
             "file_id": file_id  # 파일 ID 추가
         }
         yield f"data: {json.dumps(result)}\n\n"
