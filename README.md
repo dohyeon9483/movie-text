@@ -1,221 +1,192 @@
-# 영상 음성 변환기 (MP4 to Text Converter)
+# Movie Text
 
-MP4 영상 파일을 자동으로 텍스트로 변환해주는 웹 애플리케이션입니다.
+영상, SRT, 강의 슬라이드 자료를 작업 단위로 관리하고 자막, 음성, 더빙 영상, 강의 영상을 생성하는 로컬 FastAPI 애플리케이션입니다.
 
-## 🌟 주요 기능
+## 주요 기능
 
-### 1. 두 가지 변환 모드
-**🎤 마이크로 녹음하기**
-- 실시간 음성 녹음
-- 브라우저에서 직접 녹음 (MediaRecorder API)
-- 녹음 시간 실시간 표시
-- 녹음 완료 후 즉시 텍스트 변환
+- 영상/음성 파일 업로드 후 Whisper 기반 SRT 추출
+- 한국어 SRT 보정, 영어 SRT 번역
+- SRT 기반 TTS 음성 생성
+- 원본 영상과 생성 음성 합성
+- 자막 번인 영상 생성
+- 자막+더빙 최종 영상 생성
+- 발표 장표와 엑셀 대본 기반 강의 영상 생성
+- 간단한 영상 편집: 자르기, 앞/뒤 영상 붙이기, LogoIntro 일괄 삽입
+- 생성 산출물 관리와 일괄 다운로드
+- AI 사용량과 예상 비용 조회
 
-**📁 파일 업로드하기**
-- 영상 파일: MP4, MOV, AVI, MKV, WebM
-- 음성 파일: MP3, WAV, M4A, FLAC, OGG, AAC, WMA, Opus
-- 텍스트 파일: TXT (직접 업로드)
-- 여러 파일 동시 업로드 가능
-- 드래그 앤 드롭 지원
+## 기술 스택
 
-### 2. AI 요약 기능 (Gemini API)
-- 🎯 **일반 요약**: 범용적인 내용 요약
-- 📋 **회의록**: 안건, 논의사항, 결정사항 정리
-- 📚 **강의 요약**: 핵심 개념, 예시, 요점 정리
-- 🎥 **영상/유튜브 요약**: 주요 내용, 타임라인, 핵심 메시지
-- 💬 **일상 대화 요약**: 대화 흐름, 주요 토픽 정리
+- Backend: FastAPI, Uvicorn
+- Speech-to-text: OpenAI Whisper local model
+- TTS: Gemini TTS, Google Cloud Text-to-Speech
+- Text AI: Gemini
+- Media processing: FFmpeg, pydub
+- Spreadsheet parsing: openpyxl
+- Frontend: HTML, CSS, JavaScript
+- Storage: SQLite plus local media/artifact folders
 
-### 3. 파일 관리 대시보드
-- 📊 모든 파일 목록 조회
-- 🔍 파일 검색 기능
-- 📥 원본/요약본 선택 다운로드
-- 🗑️ 파일 삭제
-- 💾 자동 저장 (JSON 데이터베이스)
+## 설치
 
-### 고급 기능
-- 🤖 OpenAI Whisper를 이용한 고품질 한국어 음성 인식
-- 📊 11단계의 상세한 진행 상황 표시
-- ⚡ Server-Sent Events를 통한 실시간 진행 상황 업데이트
-- 💻 깔끔하고 직관적인 모던 UI
+Python 3.10 이상을 권장합니다.
 
-## 설치 방법
+```bash
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-### 1. Gemini API 키 설정 (선택 사항)
+FFmpeg가 필요합니다.
 
-AI 요약 기능을 사용하려면 Gemini API 키가 필요합니다.
-
-**✨ 추천 방법: 웹 UI에서 직접 입력**
-1. 애플리케이션을 실행한 후
-2. 상단의 **⚙️ 설정** 버튼 클릭
-3. **Gemini API 키** 입력란에 API 키 입력
-4. **저장** 버튼 클릭
-
-**API 키 발급 방법:**
-1. [Google AI Studio](https://makersuite.google.com/app/apikey)에 접속
-2. "Get API Key" 또는 "Create API Key" 클릭
-3. 생성된 키를 복사하여 웹 UI의 설정에 입력
-
-> **참고**: 
-> - API 키는 브라우저 로컬 스토리지에 저장되어 재접속 시 자동으로 복원됩니다
-> - API 키 없이도 음성 인식 기능은 정상적으로 사용 가능합니다
-
-### 2. ffmpeg 설치 (필수)
-
-오디오 추출을 위해 ffmpeg가 필요합니다.
-
-**Windows:**
-1. https://www.gyan.dev/ffmpeg/builds/ 에서 ffmpeg 다운로드
-2. 압축 해제 후 `bin` 폴더를 환경 변수 PATH에 추가
-3. 또는 Chocolatey 사용: `choco install ffmpeg`
-
-**확인:**
 ```bash
 ffmpeg -version
 ```
 
-### 3. Python 패키지 설치
+Windows에서는 FFmpeg를 PATH에 추가하거나 Chocolatey를 사용할 수 있습니다.
 
 ```bash
-pip install -r requirements.txt
+choco install ffmpeg
 ```
 
-**참고:** Whisper 모델은 처음 실행 시 자동으로 다운로드됩니다 (약 140MB).
+## 실행
 
-## 실행 방법
-
-### 🚀 간편 실행 (추천)
-
-#### ✅ 방법 1: run.bat 실행 (Windows)
-`run.bat` 파일을 더블클릭하세요.
-- 영어 메시지로 인코딩 문제 없음
-- 자동으로 패키지 설치 및 서버 시작
-- 브라우저 자동 실행
-
-#### ✅ 방법 2: Python 스크립트 실행 (권장)
-`start_server.py` 파일을 더블클릭하세요.
-- 의존성 자동 체크
-- 크로스 플랫폼 지원 (Windows/Mac/Linux)
-- 브라우저 자동 실행
-
-#### 방법 3: 명령 프롬프트에서 실행
 ```bash
-# 패키지 설치 (처음 한 번만)
-pip install -r requirements.txt
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
 
-# 서버 실행
+또는:
+
+```bash
 python start_server.py
 ```
 
-### 📟 수동 실행 (개발자용)
+브라우저에서 접속합니다.
 
-```bash
-python main.py
+```text
+http://127.0.0.1:8000
 ```
 
-서버가 시작되면 브라우저에서 http://localhost:8000 으로 접속하세요.
+## 환경 설정
 
-### ⚠️ 문제 해결
+`.env` 파일은 저장소에 포함하지 않습니다. 필요 시 로컬에서 직접 생성합니다.
 
-**한글이 깨져서 배치 파일이 실행되지 않는 경우:**
-- ✅ `run.bat` 사용 (영어 버전)
-- ✅ 또는 `python start_server.py` 직접 실행
+예시:
 
-## 사용 방법
+```env
+GEMINI_PROVIDER=vertex_ai
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GEMINI_TEXT_MODEL=gemini-2.5-flash
+GEMINI_TTS_MODEL=gemini-2.5-flash-tts
+TTS_PROVIDER=gemini
+WHISPER_MODEL=large-v3
+```
 
-### 모드 1: 🎤 마이크로 녹음하기
-1. "마이크로 녹음하기" 선택
-2. "녹음 시작" 버튼 클릭 (마이크 권한 허용 필요)
-3. 말씀하세요 (실시간 타이머 표시)
-4. "녹음 중지" 버튼으로 녹음 완료
-5. "변환 시작" 버튼으로 텍스트 변환
-6. 결과 확인 및 다운로드
+Google Cloud 서비스 계정 JSON은 `secrets/` 같은 로컬 전용 경로에 두고 Git에 올리지 않습니다.
 
-### 모드 2: 📁 파일 업로드하기
-1. "파일 업로드하기" 선택
-2. **여러 개의 영상/음성/텍스트 파일**을 한번에 드래그 앤 드롭하거나 클릭하여 업로드
-   - 영상: MP4, MOV, AVI, MKV
-   - 음성: MP3, WAV, M4A, FLAC 등
-   - 텍스트: TXT (음성 인식 없이 바로 요약 가능)
-3. 각 파일의 진행 상황을 실시간으로 확인
-   - 11단계의 상세한 진행 과정 표시
-   - 각 파일별 독립적인 진행률 바
-4. 변환된 텍스트 확인
-5. TXT 파일로 다운로드
-   - 개별 다운로드: 각 파일 옆 "다운로드" 버튼 (예: video.mp4 → video.txt)
-   - 전체 다운로드: "전체 다운로드" 버튼으로 모든 파일을 개별적으로 다운로드
+## 강의 슬라이드 영상 생성
 
-### 모드 3: 📊 대시보드에서 파일 관리
-1. 상단의 **📊 대시보드** 버튼 클릭
-2. 업로드/녹음한 모든 파일 목록 확인
-3. **보기** 버튼으로 파일 상세 정보 확인
-   - 원본 텍스트 조회
-   - 5가지 AI 요약 선택 가능:
-     - 🎯 일반 요약
-     - 📋 회의록
-     - 📚 강의 요약
-     - 🎥 영상 요약
-     - 💬 대화 요약
-4. **✨ 요약 생성** 버튼으로 현재 선택한 요약 타입 생성
-5. **📥 다운로드** 버튼으로 원본/요약본 다운로드
-6. **🗑️ 삭제** 버튼으로 파일 삭제
-7. 🔍 검색창으로 파일명 검색
+강의 영상 생성은 다음 입력을 사용합니다.
 
-### ⚙️ 설정
-1. 상단의 **⚙️ 설정** 버튼 클릭
-2. **Gemini API 키** 입력
-3. API 키 상태 확인 (설정됨/설정 안 됨)
+- 슬라이드 이미지: `.png`, `.jpg`, `.jpeg`
+- 장표별 대본 엑셀: `.xlsx`
 
-## 기술 스택
+엑셀은 `slides` 시트 하나만 사용합니다.
 
-- **백엔드:** FastAPI (Python), Server-Sent Events (SSE)
-- **음성 인식:** OpenAI Whisper (로컬 모델)
-- **AI 요약:** Google Gemini API
-- **데이터베이스:** JSON 파일 기반 저장소
-- **오디오 처리:** ffmpeg, pydub
-- **프론트엔드:** HTML5, CSS3, JavaScript (MediaRecorder API)
-- **실시간 통신:** SSE (Server-Sent Events)
+| column | name | description |
+| --- | --- | --- |
+| A | `slide_no` | 슬라이드 순서 번호 |
+| B | `slide_file` | 업로드한 슬라이드 이미지 파일명 |
+| C | `script` | 해당 장표에서 읽을 전체 대사 |
+
+예시:
+
+| slide_no | slide_file | script |
+| ---: | --- | --- |
+| 1 | `3-1-1-1-kr.png` | 안녕하세요. 이번 강의에서는 데이터 분석 흐름을 살펴보겠습니다. |
+| 2 | `3-1-1-2-kr.png` | 여기서는 Gemini와 Google Sheet를 활용하는 방법을 설명합니다. |
+
+처리 흐름:
+
+1. 엑셀의 장표별 대본으로 TTS 음성을 생성합니다.
+2. 생성된 음성을 Whisper로 다시 분석해 실제 타임코드를 얻습니다.
+3. 최종 SRT의 시간은 Whisper 결과를 사용합니다.
+4. 최종 SRT의 텍스트는 Whisper 텍스트가 아니라 엑셀 원문을 기준으로 다시 매칭합니다.
+5. 생성된 음성 길이에 맞춰 슬라이드 영상과 자막/음성을 합성합니다.
+
+이 구조는 Whisper가 `Gemini`를 `Gemina`처럼 잘못 받아쓰는 경우에도 최종 자막 텍스트가 엑셀 원문을 따르도록 하기 위한 것입니다.
+
+## 영상 편집
+
+영상 편집 탭에서는 자막/더빙 작업 없이 편집용 영상을 업로드해 간단한 후처리를 수행합니다.
+
+- 선택 구간 자르기
+- 앞/뒤 영상 붙이기
+- 기본 `assets/video_editor/LogoIntro.mp4` 일괄 삽입
+
+`LogoIntro.mp4`는 기본 앱 에셋으로 저장소에 포함됩니다.
+
+## AI 사용량과 예상 비용
+
+설정 탭에서 기간을 지정해 AI 사용 이벤트와 예상 비용을 확인할 수 있습니다.
+
+기록 대상:
+
+- Gemini 텍스트 요청
+- Gemini TTS 요청
+- Google Cloud TTS 요청
+
+비용은 API 사용량 메타데이터 또는 내부 추정치 기반의 예상값입니다.
+
+## 테스트
+
+```bash
+python -m py_compile main.py database.py ai_usage.py lecture_timeline.py srt_utils.py video_utils.py test_media_features.py
+python -m unittest test_media_features.py
+```
+
+## Git에 포함하지 않는 파일
+
+아래 항목은 실행 중 자동 생성되는 로컬 파일이므로 Git에 포함하지 않습니다.
+
+- `.env`
+- `secrets/`
+- `venv/`
+- `media/`
+- `outputs/`
+- `uploads/`
+- `thumbnails/`
+- `files_db.sqlite`
+- `server_*.log`, `*_log.txt`
+- `__pycache__/`
 
 ## 프로젝트 구조
 
-```
-movie-to-txt/
-├── run.bat                  # Windows 간편 실행 파일
-├── start_server.py          # 크로스 플랫폼 실행 스크립트 (권장)
-├── main.py                  # FastAPI 서버 (SSE 지원, API 엔드포인트)
-├── database.py              # JSON 기반 파일 메타데이터 저장소
-├── requirements.txt         # Python 의존성
-├── README.md                # 프로젝트 설명
-├── .gitignore               # Git 제외 파일 목록
-├── database.json            # 파일 메타데이터 DB (자동 생성)
-├── uploads/                 # 임시 업로드 폴더 (자동 생성)
-└── static/                  # 프론트엔드 파일
-    ├── index.html           # 메인 UI (홈/대시보드/설정)
-    ├── style.css            # 모던한 디자인 스타일
-    └── script.js            # 전체 프론트엔드 로직
+```text
+.
+├── main.py                 # FastAPI app and workflow orchestration
+├── database.py             # SQLite file/job/artifact storage
+├── ai_usage.py             # AI usage and estimated-cost tracking
+├── lecture_timeline.py     # lecture XLSX template and parser
+├── srt_utils.py            # SRT parsing, formatting, correction helpers
+├── video_utils.py          # FFmpeg video helpers
+├── static/
+│   ├── index.html
+│   ├── script.js
+│   └── style.css
+├── assets/
+│   └── video_editor/
+│       └── LogoIntro.mp4
+├── test_media_features.py
+├── requirements.txt
+├── start_server.py
+└── run.bat
 ```
 
 ## 주의사항
 
-- 영상 길이에 따라 변환 시간이 달라집니다
-- 대용량 파일은 처리 시간이 오래 걸릴 수 있습니다
-- 한국어 음성에 최적화되어 있습니다
-- 첫 실행 시 Whisper 모델 다운로드로 시간이 소요될 수 있습니다
-
-## 문제 해결
-
-### ffmpeg를 찾을 수 없다는 오류
-- ffmpeg가 제대로 설치되었는지 확인
-- 환경 변수 PATH에 ffmpeg가 추가되었는지 확인
-
-### 메모리 부족 오류
-- 환경 변수 `WHISPER_MODEL`을 `turbo`, `small`, `base`, `tiny` 중 하나로 설정
-
-### 음성 인식 정확도가 낮음
-- 기본값은 정확도 우선의 `large-v3`입니다
-- 속도나 메모리가 부담되면 환경 변수 `WHISPER_MODEL`을 `turbo`, `medium`, `small` 중 하나로 설정
-- 단, 더 많은 메모리와 처리 시간 필요
-
-## 라이선스
-
-MIT License
-
+- Whisper 모델은 처음 실행할 때 다운로드 시간이 걸릴 수 있습니다.
+- GPU가 있으면 Whisper 음성 인식에 GPU를 사용할 수 있고, 없으면 CPU로 실행됩니다.
+- Gemini/Google Cloud 기반 TTS는 원격 API를 사용하므로 로컬 GPU를 사용하지 않습니다.
+- 긴 영상과 큰 오디오 파일은 처리 시간이 오래 걸릴 수 있습니다.
+- GitHub에 올리기 전 `.env`, 서비스 계정 JSON, 생성 영상/음성 파일이 포함되지 않았는지 확인하세요.
