@@ -7,6 +7,8 @@ import unittest
 import warnings
 from pathlib import Path
 
+from openpyxl import load_workbook
+
 
 class _FakeCuda:
     @staticmethod
@@ -136,7 +138,7 @@ class MediaFeatureTests(unittest.TestCase):
     def test_srt_tts_timeline_matches_last_cue_end(self):
         calls = []
 
-        async def fake_generate_tts_wav(text, language, wav_path, voice_name=None, style_prompt=None):
+        async def fake_generate_tts_wav(text, language, wav_path, voice_name=None, style_prompt=None, tts_provider=None):
             calls.append(text)
             main.write_wave_file(Path(wav_path), b"\0\0" * 2400)
 
@@ -273,7 +275,7 @@ class MediaFeatureTests(unittest.TestCase):
                     srt_text="1\n00:00:00,000 --> 00:00:01,000\nHello",
                 )
 
-                async def fake_create_video(file, language, voice_name=None, style_prompt=None, srt_source=None):
+                async def fake_create_video(file, language, voice_name=None, style_prompt=None, srt_source=None, tts_provider=None):
                     return db.create_artifact(
                         file["id"],
                         "video",
@@ -361,6 +363,174 @@ class MediaFeatureTests(unittest.TestCase):
 
         self.assertIn("00:00:00,000 --> 00:00:02,000", output)
         self.assertIn("튜토리얼입니다.", output)
+
+
+    def test_correct_korean_srt_accepts_resegmented_cues(self):
+        class _FakeResponse:
+            text = (
+                '[{"start": "00:00:00,000", "end": "00:00:03,000", "text": "First natural cue."}, '
+                '{"start": "00:00:03,000", "end": "00:00:06,000", "text": "Second natural cue."}]'
+            )
+
+        class _FakeModels:
+            @staticmethod
+            def generate_content(model, contents):
+                return _FakeResponse()
+
+        class _FakeGeminiClient:
+            models = _FakeModels()
+
+        original_client = main.gemini_text_client
+        original_key = main.gemini_api_key
+        main.gemini_text_client = _FakeGeminiClient()
+        main.gemini_api_key = "test-key"
+        try:
+            output = asyncio.run(
+                main.correct_korean_srt(
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,000\n"
+                    "First\n\n"
+                    "2\n"
+                    "00:00:01,000 --> 00:00:06,000\n"
+                    "natural cue. Second natural cue.\n"
+                )
+            )
+        finally:
+            main.gemini_text_client = original_client
+            main.gemini_api_key = original_key
+
+        self.assertIn("00:00:00,000 --> 00:00:03,000", output)
+        self.assertIn("00:00:03,000 --> 00:00:06,000", output)
+        self.assertIn("First natural cue.", output)
+        self.assertIn("Second natural cue.", output)
+
+    def _lecture_xlsx(self, rows):
+        workbook = main.Workbook()
+        sheet = workbook.active
+        sheet.title = "slides"
+        for row in rows:
+            sheet.append(row)
+        buffer = main.io.BytesIO()
+        workbook.save(buffer)
+        return buffer.getvalue()
+
+    def test_parse_lecture_timeline_accepts_single_sheet_slide_scripts(self):
+        content = self._lecture_xlsx([
+            ["slide_no", "slide_file", "script"],
+            [1, "LLM_slide_1.png", "Hello there"],
+            [2, "LLM_slide_2.png", "friend"],
+        ])
+        result = main.parse_lecture_timeline_xlsx(
+            content,
+            ["LLM_slide_1.png", "LLM_slide_2.png"],
+            "",
+        )
+
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(result["items"][1]["slide_no"], 2)
+        self.assertEqual(result["items"][1]["script"], "friend")
+        self.assertEqual(result["items"][0]["script"], "Hello there")
+        self.assertEqual(result["scripts"][0]["text"], "Hello there")
+
+    def test_parse_lecture_timeline_reports_invalid_rows(self):
+        content = self._lecture_xlsx([
+            [1, "missing.png", "Hello"],
+            [1, "LLM_slide_1.png", "Duplicate"],
+            [2, "LLM_slide_2.png", ""],
+            ["bad", "LLM_slide_2.png", "friend"],
+        ])
+        result = main.parse_lecture_timeline_xlsx(
+            content,
+            ["LLM_slide_1.png", "LLM_slide_2.png"],
+            "",
+        )
+
+        self.assertTrue(any("missing.png" in error for error in result["errors"]))
+        self.assertTrue(any("duplicate slide_no" in error for error in result["errors"]))
+        self.assertTrue(any("slide_no must be a positive number" in error for error in result["errors"]))
+        self.assertTrue(any("script is empty" in error for error in result["errors"]))
+
+    def test_parse_lecture_timeline_warns_for_slide_number_gaps_and_unused_files(self):
+        content = self._lecture_xlsx([
+            ["slide_no", "slide_file", "script"],
+            [1, "LLM_slide_1.png", "Hello"],
+            [3, "LLM_slide_2.png", "friend"],
+        ])
+        result = main.parse_lecture_timeline_xlsx(
+            content,
+            ["LLM_slide_1.png", "LLM_slide_2.png", "unused.png"],
+            "",
+        )
+
+        self.assertEqual(result["errors"], [])
+        self.assertTrue(any("Gap before slide" in warning for warning in result["warnings"]))
+        self.assertTrue(any("unused.png" in warning for warning in result["warnings"]))
+
+    def test_lecture_template_uses_single_slide_script_sheet(self):
+        workbook = load_workbook(main.io.BytesIO(main.create_lecture_timeline_template()), read_only=True, data_only=True)
+
+        self.assertEqual(workbook.sheetnames, ["slides"])
+        sheet = workbook["slides"]
+        self.assertEqual([sheet["A1"].value, sheet["B1"].value, sheet["C1"].value], ["slide_no", "slide_file", "script"])
+        self.assertTrue(str(sheet["C2"].value).strip())
+
+    def test_align_generated_srt_uses_excel_script_with_actual_timings(self):
+        generated_srt = (
+            "1\n00:00:00,000 --> 00:00:02,000\n"
+            "이번 챕터에서는 Gemina를 사용합니다.\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\n"
+            "이번 챕털의 로드맵입니다.\n"
+        )
+        timeline_items = [{
+            "slide_no": 1,
+            "script": "이번 챕터에서는 Gemini를 사용합니다. 이번 챕터의 로드맵입니다.",
+            "speech_start_seconds": 0.0,
+            "speech_end_seconds": 4.0,
+        }]
+
+        aligned_srt, metadata = main.align_generated_srt_to_lecture_scripts(generated_srt, timeline_items)
+
+        self.assertTrue(metadata["aligned"])
+        self.assertIn("Gemini", aligned_srt)
+        self.assertIn("챕터", aligned_srt)
+        self.assertNotIn("Gemina", aligned_srt)
+        self.assertNotIn("챕털", aligned_srt)
+        self.assertIn("00:00:00,000 --> 00:00:02,000", aligned_srt)
+        self.assertIn("00:00:02,000 --> 00:00:04,000", aligned_srt)
+
+    def test_align_generated_srt_does_not_pack_later_excel_sentences_into_early_cue(self):
+        generated_srt = (
+            "1\n00:00:00,000 --> 00:00:02,000\n"
+            "이번 챕터에서는 Gemina와 구글 시트를 활용합니다.\n\n"
+            "2\n00:00:02,000 --> 00:00:10,000\n"
+            "여기서 말하는 결과물은 단순히 합계나 평균을 낸 표가 아니고요.\n\n"
+            "3\n00:00:10,000 --> 00:00:18,000\n"
+            "데이터를 볼 관점을 잡고 데이터 상태를 확인합니다.\n\n"
+            "4\n00:00:18,000 --> 00:00:25,000\n"
+            "핵심 지표 KPI를 고른 다음에 다음 행동 공유 자료로 정리하는 흐름입니다.\n"
+        )
+        timeline_items = [{
+            "slide_no": 1,
+            "script": (
+                "이번 챕터에서는 Gemini와 Google Sheet를 활용합니다. "
+                "여기서 말하는 결과물은 단순히 합계나 평균을 낸 표가 아니고요. "
+                "데이터를 볼 관점을 잡고, 데이터 상태를 확인합니다. "
+                "핵심 지표 KPI를 고른 다음에 다음 행동 공유 자료로 정리하는 흐름입니다."
+            ),
+            "speech_start_seconds": 0.0,
+            "speech_end_seconds": 25.0,
+        }]
+
+        aligned_srt, _ = main.align_generated_srt_to_lecture_scripts(generated_srt, timeline_items)
+        cues = main.parse_srt(aligned_srt)
+
+        self.assertEqual(cues[1]["end"], 10.0)
+        self.assertIn("여기서 말하는 결과물", cues[1]["text"])
+        self.assertNotIn("데이터를 볼 관점", cues[1]["text"])
+        self.assertGreaterEqual(cues[2]["start"], 10.0)
+        self.assertIn("데이터를 볼 관점", cues[2]["text"])
+        self.assertIn("KPI", cues[3]["text"])
 
 
 if __name__ == "__main__":

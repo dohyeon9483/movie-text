@@ -1,23 +1,42 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>영상 제작 작업 보드</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=lecture-voice-preview-2">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>영상 제작 작업 보드</h1>
-            <p>영상과 SRT를 작업 카드로 관리하고 자막, 음성, 더빙 영상을 생성합니다</p>
-            <nav class="main-nav">
-                <button id="navHome" class="nav-btn active">홈</button>
+        <aside class="app-sidebar">
+            <header class="sidebar-header" role="button" tabindex="0" data-open-workspace="home">
+                <h1>영상 제작 스튜디오</h1>
+                <p>제작, 강의 슬라이드, 편집 작업을 관리합니다.</p>
+            </header>
+            <section class="sidebar-group" aria-label="작업 선택">
+                <p class="sidebar-label">작업</p>
+                <button class="workspace-card active" type="button" data-open-workspace="home">
+                    <span>더빙 작업</span>
+                    <strong>원본 영상을 전달하고, SRT 자막과 번역 음성을 생성합니다.</strong>
+                </button>
+                <button class="workspace-card" type="button" data-open-workspace="lecture_project">
+                    <span>영상 생성</span>
+                    <strong>발표 장표와 대본을 기반으로 음성, 자막, 영상을 생성합니다.</strong>
+                </button>
+                <button class="workspace-card" type="button" data-open-workspace="video_editor">
+                    <span>영상 편집</span>
+                    <strong>자르기, 붙이기, 인트로 등 간단한 작업을 수행합니다.</strong>
+                </button>
+            </section>
+            <nav class="main-nav" aria-label="관리 메뉴">
+                <p class="sidebar-label">관리</p>
+                <button id="navArtifacts" class="nav-btn">전체 산출물</button>
                 <button id="navSettings" class="nav-btn">설정</button>
             </nav>
-        </header>
+        </aside>
 
+        <div class="app-main">
         <main id="homeSection" class="board-section">
             <section class="board-toolbar">
                 <div>
@@ -25,32 +44,322 @@
                     <h2>다중 영상 작업</h2>
                 </div>
                 <div class="board-actions">
-                    <input type="file" id="boardFileInput" accept=".mp4,.mov,.avi,.mkv,.webm" multiple hidden>
-                    <button id="boardUploadBtn" class="btn-action primary">영상 업로드</button>
+                    <input type="file" id="boardFileInput" accept=".mp4,.mov,.avi,.mkv,.webm,.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.opus,.txt,.srt" multiple hidden>
+                    <button id="boardUploadBtn" class="btn-action primary">영상 여러 개 업로드</button>
                     <button id="openScriptJobBtn" class="btn-action secondary">SRT로 새 작업</button>
+                    <span class="board-action-hint">파일 선택창에서 여러 영상을 한꺼번에 선택할 수 있습니다.</span>
                 </div>
             </section>
 
             <section class="board-filters">
-                <input type="text" id="boardSearchInput" class="search-input" placeholder="파일명 또는 작업명 검색">
-                <select id="boardStatusFilter" class="api-key-input">
-                    <option value="all">전체 상태</option>
-                    <option value="running">진행 중</option>
-                    <option value="completed">완료</option>
-                    <option value="failed">오류</option>
-                    <option value="idle">대기</option>
-                </select>
-                <button id="selectAllCardsBtn" class="btn-toolbar">전체 선택</button>
-                <button id="clearCardSelectionBtn" class="btn-toolbar">선택 해제</button>
-                <button id="downloadSelectedCardsBtn" class="btn-toolbar primary">선택 SRT 다운로드</button>
-                <button id="deleteSelectedCardsBtn" class="btn-toolbar danger">선택 삭제</button>
+                <div class="board-filter-controls">
+                    <input type="text" id="boardSearchInput" class="search-input" placeholder="파일명 또는 작업명 검색">
+                    <select id="boardStatusFilter" class="api-key-input">
+                        <option value="all">전체 상태</option>
+                        <option value="running">진행 중</option>
+                        <option value="completed">완료</option>
+                        <option value="failed">오류</option>
+                        <option value="idle">대기</option>
+                    </select>
+                </div>
+                <div class="board-filter-actions">
+                    <button id="selectAllCardsBtn" class="btn-toolbar">전체 선택</button>
+                    <button id="clearCardSelectionBtn" class="btn-toolbar">선택 해제</button>
+                    <button id="downloadSelectedCardsBtn" class="btn-toolbar primary">선택 SRT 다운로드</button>
+                    <button id="runSelectedPipelineBtn" class="btn-toolbar primary">선택 제작 실행</button>
+                    <button id="deleteSelectedCardsBtn" class="btn-toolbar danger">선택 삭제</button>
+                </div>
+            </section>
+
+            <section class="auto-pipeline-panel">
+                <div class="auto-pipeline-header">
+                    <div>
+                        <p class="workflow-kicker">Batch preset</p>
+                        <h3>일괄 제작 프리셋</h3>
+                    </div>
+                </div>
+                <div class="auto-pipeline-grid">
+                    <div>
+                        <label for="autoPipelineLanguage">제작 언어</label>
+                        <select id="autoPipelineLanguage" class="api-key-input">
+                            <option value="en" selected>English</option>
+                            <option value="ko">한국어</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="autoPipelineOutput">최종 산출물</label>
+                        <select id="autoPipelineOutput" class="api-key-input">
+                            <option value="captioned_dub_video" selected>자막+더빙 영상</option>
+                            <option value="dub_video">더빙 영상</option>
+                            <option value="subtitle_video">자막 영상</option>
+                            <option value="audio">음성 MP3</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="autoPipelineSubtitlePreset">자막 형태 프리셋</label>
+                        <select id="autoPipelineSubtitlePreset" class="api-key-input"></select>
+                    </div>
+                    <div>
+                        <label for="autoPipelineProvider">음성 엔진</label>
+                        <select id="autoPipelineProvider" class="api-key-input">
+                            <option value="gemini">Gemini</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="autoPipelineVoice" class="label-with-info">
+                            음성
+                            <span class="info-tooltip" id="autoPipelineVoiceInfo" role="button" tabindex="0" aria-expanded="false" aria-label="음성 모델 특징 보기">
+                                i
+                                <span class="info-tooltip-panel" id="autoPipelineVoiceTooltip"></span>
+                            </span>
+                        </label>
+                        <select id="autoPipelineVoice" class="api-key-input"></select>
+                        <div class="voice-sample-row">
+                            <audio id="autoPipelineVoiceSample" controls preload="none"></audio>
+                            <span id="autoPipelineVoiceSampleStatus">샘플 준비 확인 중</span>
+                        </div>
+                    </div>
+                    <div>
+                        <label for="autoPipelineTone">톤</label>
+                        <select id="autoPipelineTone" class="api-key-input">
+                            <option value="bright_natural" selected>밝고 자연스럽게</option>
+                            <option value="clear_lecture">명확한 강의 톤</option>
+                            <option value="calm">차분하게</option>
+                            <option value="energetic">활기 있게</option>
+                        </select>
+                    </div>
+                </div>
             </section>
 
             <div id="uploadQueue" class="upload-queue hidden"></div>
+            <section id="batchUploadedPanel" class="batch-uploaded-panel hidden">
+                <div class="batch-uploaded-header">
+                    <div>
+                        <p class="workflow-kicker">Ready to run</p>
+                        <h3>이번 업로드 목록</h3>
+                    </div>
+                    <div class="batch-uploaded-actions">
+                        <button id="selectUploadedBatchBtn" class="btn-toolbar">업로드 목록 전체 선택</button>
+                        <button id="runUploadedBatchBtn" class="btn-action primary">선택 항목 제작 실행</button>
+                    </div>
+                </div>
+                <div id="batchUploadedList" class="batch-uploaded-list"></div>
+            </section>
             <section id="jobBoard" class="job-board">
                 <div class="loading">작업을 불러오는 중...</div>
             </section>
         </main>
+
+        <section id="lectureProjectSection" class="board-section hidden">
+            <section class="board-toolbar">
+                <div>
+                    <p class="workflow-kicker">Lecture slides</p>
+                    <h2>강의 슬라이드 영상 생성</h2>
+                    <p class="section-desc">슬라이드 이미지와 장표별 대본 엑셀을 업로드해 생성 음성 길이에 맞춘 강의 영상을 만듭니다.</p>
+                </div>
+                <div class="board-actions">
+                    <a class="btn-toolbar primary" href="/api/lecture-projects/template" download>엑셀 템플릿 다운로드</a>
+                </div>
+            </section>
+
+            <section class="lecture-project-panel">
+                <div class="lecture-project-grid">
+                    <label>
+                        <span>슬라이드 이미지</span>
+                        <input id="lectureSlidesInput" class="api-key-input" type="file" accept=".png,.jpg,.jpeg" multiple>
+                    </label>
+                    <label>
+                        <span>장표별 대본 엑셀</span>
+                        <input id="lectureTimelineInput" class="api-key-input" type="file" accept=".xlsx">
+                    </label>
+                    <label>
+                        <span>언어</span>
+                        <select id="lectureLanguageSelect" class="api-key-input">
+                            <option value="ko">한국어</option>
+                            <option value="en">English</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>최종 산출물</span>
+                        <select id="lectureOutputSelect" class="api-key-input">
+                            <option value="captioned_dub_video" selected>자막+더빙 영상</option>
+                            <option value="dub_video">더빙 영상</option>
+                            <option value="subtitle_video">자막 영상</option>
+                            <option value="audio">음성 MP3</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>음성 엔진</span>
+                        <select id="lectureProviderSelect" class="api-key-input">
+                            <option value="gemini">Gemini</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>음성</span>
+                        <div class="lecture-voice-control">
+                            <select id="lectureVoiceSelect" class="api-key-input"></select>
+                            <button id="lectureVoiceSampleBtn" class="btn-toolbar" type="button">미리듣기</button>
+                        </div>
+                        <div class="voice-sample-row compact">
+                            <audio id="lectureVoiceSample" preload="none"></audio>
+                            <span id="lectureVoiceSampleStatus">샘플 준비 확인 중</span>
+                        </div>
+                    </label>
+                    <label>
+                        <span>톤</span>
+                        <select id="lectureToneSelect" class="api-key-input">
+                            <option value="clear_lecture" selected>명확한 강의 톤</option>
+                            <option value="bright_natural">밝고 자연스럽게</option>
+                            <option value="calm">차분하게</option>
+                            <option value="energetic">에너지 있게</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="lecture-project-actions">
+                    <button id="lectureCreateBtn" class="btn-action primary" type="button">강의 영상 생성</button>
+                    <span id="lectureProjectStatus" class="video-edit-status"></span>
+                </div>
+                <div id="lectureValidationResult" class="lecture-validation-result hidden"></div>
+            </section>
+        </section>
+
+        <section id="videoEditorSection" class="board-section hidden">
+            <section class="board-toolbar">
+                <div>
+                    <p class="workflow-kicker">Video editor</p>
+                    <h2>영상 편집</h2>
+                    <p class="section-desc">자막/더빙 작업 없이 새 영상을 업로드해서 자르기, 인트로, 아웃트로 삽입만 처리합니다.</p>
+                </div>
+                <div class="board-actions">
+                    <input type="file" id="editorFileInput" accept=".mp4,.mov,.avi,.mkv,.webm" multiple hidden>
+                    <button id="editorUploadBtn" class="btn-action primary">편집 영상 업로드</button>
+                    <button id="editorRefreshBtn" class="btn-toolbar">새로고침</button>
+                </div>
+            </section>
+
+            <section class="standalone-editor-layout">
+                <aside class="editor-file-panel">
+                    <div class="editor-panel-header">
+                        <h3>업로드 파일</h3>
+                        <span id="editorFileCount">0개</span>
+                    </div>
+                    <div class="editor-selection-actions">
+                        <button id="editorSelectAllBtn" class="btn-toolbar" type="button">전체 선택</button>
+                        <button id="editorClearSelectionBtn" class="btn-toolbar" type="button">선택 해제</button>
+                        <span id="editorSelectedCount">선택 0개</span>
+                    </div>
+                    <div id="editorFileList" class="editor-file-list">
+                        <div class="empty-state">편집할 영상을 업로드하세요.</div>
+                    </div>
+                </aside>
+
+                <section class="editor-workspace">
+                    <div class="editor-preview-header">
+                        <div>
+                            <p class="workflow-kicker">Preview</p>
+                            <h3 id="editorCurrentTitle">선택된 영상 없음</h3>
+                        </div>
+                    </div>
+                    <video id="editorPreviewPlayer" class="editor-preview-player" controls preload="metadata"></video>
+                    <div id="editorStatus" class="editor-status hidden"></div>
+                    <div id="editorArtifactsList" class="editor-artifacts-list"></div>
+                </section>
+
+                <aside class="editor-tools-panel">
+                    <section class="editor-tool-card">
+                        <h3>고정 LogoIntro 일괄 삽입</h3>
+                        <p class="tool-hint">프로젝트에 저장된 LogoIntro.mp4를 선택한 여러 영상에 같은 방식으로 적용합니다.</p>
+                        <label for="editorLogoIntroPositionSelect">삽입 위치</label>
+                        <select id="editorLogoIntroPositionSelect" class="api-key-input">
+                            <option value="before">앞에 붙이기</option>
+                            <option value="after">뒤에 붙이기</option>
+                            <option value="both">앞/뒤 모두 붙이기</option>
+                        </select>
+                        <div class="editor-button-row">
+                            <button id="editorLogoIntroSelectedBtn" class="btn-action primary" type="button">선택 영상에 적용</button>
+                            <button id="editorLogoIntroAllBtn" class="btn-toolbar" type="button">전체 영상에 적용</button>
+                        </div>
+                    </section>
+                    <section class="editor-tool-card">
+                        <h3>자르기</h3>
+                        <div class="form-grid two">
+                            <div>
+                                <label for="editorTrimStartSeconds">시작 초</label>
+                                <input id="editorTrimStartSeconds" class="api-key-input" type="number" min="0" step="0.1" value="0">
+                            </div>
+                            <div>
+                                <label for="editorTrimEndSeconds">끝 초</label>
+                                <input id="editorTrimEndSeconds" class="api-key-input" type="number" min="0" step="0.1" placeholder="예: 12.5">
+                            </div>
+                        </div>
+                        <button id="editorTrimBtn" class="btn-action primary full-width">자른 영상 생성</button>
+                    </section>
+
+                    <section class="editor-tool-card">
+                        <h3>사용자 영상 붙이기</h3>
+                        <p class="tool-hint">업로드한 영상이나 기존 영상을 앞, 뒤, 또는 앞뒤에 직접 선택해서 붙입니다.</p>
+                        <label for="editorConcatPositionSelect">삽입 위치</label>
+                        <select id="editorConcatPositionSelect" class="api-key-input">
+                            <option value="before">앞에 붙이기</option>
+                            <option value="after">뒤에 붙이기</option>
+                            <option value="both">앞/뒤 모두 붙이기</option>
+                        </select>
+                        <div id="editorBeforeSourceGroup" class="editor-source-group">
+                            <label for="editorBeforeExistingSelect">앞에 붙일 기존 업로드 영상</label>
+                            <select id="editorBeforeExistingSelect" class="api-key-input"></select>
+                            <label for="editorBeforeUploadInput">또는 새 파일 업로드</label>
+                            <input id="editorBeforeUploadInput" class="api-key-input" type="file" accept=".mp4,.mov,.avi,.mkv,.webm">
+                        </div>
+                        <div id="editorAfterSourceGroup" class="editor-source-group">
+                            <label for="editorAfterExistingSelect">뒤에 붙일 기존 업로드 영상</label>
+                            <select id="editorAfterExistingSelect" class="api-key-input"></select>
+                            <label for="editorAfterUploadInput">또는 새 파일 업로드</label>
+                            <input id="editorAfterUploadInput" class="api-key-input" type="file" accept=".mp4,.mov,.avi,.mkv,.webm">
+                        </div>
+                        <button id="editorConcatBtn" class="btn-action primary full-width">붙인 영상 생성</button>
+                    </section>
+                </aside>
+            </section>
+        </section>
+
+        <section id="artifactsSection" class="board-section hidden">
+            <section class="board-toolbar">
+                <div>
+                    <p class="workflow-kicker">Output library</p>
+                    <h2>전체 산출물</h2>
+                </div>
+                <div class="board-actions">
+                    <select id="artifactKindFilter" class="api-key-input">
+                        <option value="all">전체 유형</option>
+                        <option value="srt">자막 SRT</option>
+                        <option value="audio">음성 MP3</option>
+                        <option value="subtitle_video">자막 영상</option>
+                        <option value="video">더빙 영상</option>
+                        <option value="captioned_dub_video">자막+더빙 영상</option>
+                        <option value="edited_video">편집 영상</option>
+                    </select>
+                    <select id="artifactLanguageFilter" class="api-key-input">
+                        <option value="all">전체 언어</option>
+                        <option value="ko">한국어</option>
+                        <option value="en">English</option>
+                    </select>
+                    <select id="artifactSubtitleFilter" class="api-key-input">
+                        <option value="all">전체 자막 유형</option>
+                        <option value="srt_only">SRT 자막만</option>
+                        <option value="subtitle_only">자막 영상만</option>
+                        <option value="captioned_dub">자막+더빙 영상만</option>
+                        <option value="no_subtitle">자막 없는 산출물</option>
+                    </select>
+                    <button id="selectAllArtifactsBtn" class="btn-toolbar">전체 선택</button>
+                    <button id="clearArtifactSelectionBtn" class="btn-toolbar">선택 해제</button>
+                    <button id="downloadSelectedArtifactsBtn" class="btn-toolbar primary">선택 다운로드</button>
+                    <button id="deleteSelectedArtifactsBtn" class="btn-toolbar danger">선택 삭제</button>
+                </div>
+            </section>
+            <section id="allArtifactsList" class="all-artifacts-list">
+                <div class="loading">산출물을 불러오는 중...</div>
+            </section>
+        </section>
 
         <section id="settingsSection" class="section hidden">
             <h2>설정</h2>
@@ -64,6 +373,30 @@
                     <input type="password" id="apiKeyInput" class="api-key-input" placeholder="Gemini API 키를 입력하세요">
                     <button id="saveApiKeyBtn" class="btn-save-key">저장</button>
                 </div>
+            </div>
+            <div class="settings-card">
+                <div class="settings-card-header">
+                    <div>
+                        <h3>AI 사용량 -> 예상 비용</h3>
+                        <p class="settings-desc">작업에서 사용한 AI 요청량과 예상 비용을 누적해서 확인합니다.</p>
+                    </div>
+                    <div class="ai-usage-controls">
+                        <label>
+                            <span>시작일</span>
+                            <input id="aiUsageStartDate" class="api-key-input" type="date">
+                        </label>
+                        <label>
+                            <span>종료일</span>
+                            <input id="aiUsageEndDate" class="api-key-input" type="date">
+                        </label>
+                        <button id="refreshAiUsageBtn" class="btn-toolbar" type="button">조회</button>
+                    </div>
+                </div>
+                <div id="aiUsageSummary" class="ai-usage-summary">
+                    <div class="loading">AI 사용량을 불러오는 중...</div>
+                </div>
+                <div id="aiUsageEvents" class="ai-usage-events"></div>
+                <p class="settings-note">예상 비용은 앱에서 기록한 사용량과 설정된 단가 기준입니다. 실제 청구액은 무료 사용량, 과금 계정, 지역, 모델 단가 변경에 따라 달라질 수 있습니다.</p>
             </div>
         </section>
 
@@ -97,34 +430,60 @@
                 </div>
 
                 <div class="modal-tabs">
-                    <button class="tab-btn active" data-tab="korean_srt">한국어 SRT</button>
-                    <button class="tab-btn" data-tab="corrected_srt">보정 SRT</button>
-                    <button class="tab-btn" data-tab="english_srt">English SRT</button>
+                    <button class="tab-btn active" data-tab="subtitles">자막</button>
                     <button class="tab-btn" data-tab="audio_video">제작</button>
+                    <button class="tab-btn" data-tab="video_edit">영상 편집</button>
                     <button class="tab-btn" data-tab="artifacts">산출물</button>
                 </div>
 
+                <div id="modalJobPanel" class="modal-job-panel"></div>
+
                 <div id="modalBody" class="modal-body">
-                    <div class="tab-content active" data-content="korean_srt">
-                        <textarea id="modalKoSrt" class="workflow-srt" readonly></textarea>
-                        <div class="tab-action-row">
-                            <button id="modalCorrectBtn" class="btn-action">한국어 SRT 보정</button>
-                            <button class="btn-action" data-download-srt="ko">한국어 SRT 다운로드</button>
-                        </div>
-                    </div>
-                    <div class="tab-content" data-content="corrected_srt">
-                        <textarea id="modalCorrectedSrt" class="workflow-srt" placeholder="보정 결과가 여기에 표시됩니다. 직접 수정할 수도 있습니다."></textarea>
-                        <div class="tab-action-row">
-                            <button id="saveCorrectedSrtBtn" class="btn-toolbar">보정 SRT 저장</button>
-                            <button id="modalTranslateBtn" class="btn-action secondary">영어 자막 생성</button>
-                            <button class="btn-action" data-download-srt="corrected">보정 SRT 다운로드</button>
-                        </div>
-                    </div>
-                    <div class="tab-content" data-content="english_srt">
-                        <textarea id="modalEnSrt" class="workflow-srt" placeholder="영어 자막 생성 후 필요하면 수정하세요."></textarea>
-                        <div class="tab-action-row">
-                            <button id="saveEnglishSrtBtn" class="btn-toolbar">English SRT 저장</button>
-                            <button class="btn-action" data-download-srt="english">English SRT 다운로드</button>
+                    <div class="tab-content active" data-content="subtitles">
+                        <div class="subtitle-workflow">
+                            <section class="subtitle-stage">
+                                <div class="subtitle-stage-header">
+                                    <div>
+                                        <span class="subtitle-step-index">1</span>
+                                        <h3>초기 자막</h3>
+                                        <p>업로드 또는 SRT 작업에서 생성된 원본 한국어 SRT입니다.</p>
+                                    </div>
+                                    <button class="btn-action" data-download-srt="ko">한국어 SRT 다운로드</button>
+                                </div>
+                                <textarea id="modalKoSrt" class="workflow-srt subtitle-srt-textarea" readonly></textarea>
+                            </section>
+
+                            <section class="subtitle-stage">
+                                <div class="subtitle-stage-header">
+                                    <div>
+                                        <span class="subtitle-step-index">2</span>
+                                        <h3>보정 자막</h3>
+                                        <p>초기 자막을 보정하거나 직접 수정한 한국어 SRT입니다.</p>
+                                    </div>
+                                    <div class="subtitle-stage-actions">
+                                        <button id="modalCorrectBtn" class="btn-action">한국어 SRT 보정</button>
+                                        <button id="saveCorrectedSrtBtn" class="btn-toolbar">보정 SRT 저장</button>
+                                        <button class="btn-action" data-download-srt="corrected">보정 SRT 다운로드</button>
+                                    </div>
+                                </div>
+                                <textarea id="modalCorrectedSrt" class="workflow-srt subtitle-srt-textarea" placeholder="보정 결과가 여기에 표시됩니다. 직접 수정할 수도 있습니다."></textarea>
+                            </section>
+
+                            <section class="subtitle-stage">
+                                <div class="subtitle-stage-header">
+                                    <div>
+                                        <span class="subtitle-step-index">3</span>
+                                        <h3>English 자막</h3>
+                                        <p>보정 자막 또는 초기 자막을 기준으로 만든 영어 SRT입니다.</p>
+                                    </div>
+                                    <div class="subtitle-stage-actions">
+                                        <button id="modalTranslateBtn" class="btn-action secondary">영어 자막 생성</button>
+                                        <button id="saveEnglishSrtBtn" class="btn-toolbar">English SRT 저장</button>
+                                        <button class="btn-action" data-download-srt="english">English SRT 다운로드</button>
+                                    </div>
+                                </div>
+                                <textarea id="modalEnSrt" class="workflow-srt subtitle-srt-textarea" placeholder="영어 자막 생성 후 필요하면 수정하세요."></textarea>
+                            </section>
                         </div>
                     </div>
                     <div class="tab-content" data-content="audio_video">
@@ -143,17 +502,17 @@
                                     <button id="modalAudioBtn" class="output-choice-card" data-output-type="audio">
                                         <span class="structure-label">MP3</span>
                                         <strong>음성 MP3</strong>
-                                        <small>SRT 타임라인에 맞춘 더빙 음성입니다.</small>
+                                        <small>선택한 SRT 기준으로 더빙 음성을 먼저 만듭니다.</small>
                                     </button>
                                     <button id="modalDubBtn" class="output-choice-card" data-output-type="dub">
                                         <span class="structure-label">MP4</span>
                                         <strong>더빙 영상</strong>
-                                        <small>생성 음성을 원본 영상에 합성합니다.</small>
+                                        <small>생성된 MP3를 선택해 원본 영상에 합성합니다.</small>
                                     </button>
                                     <button id="modalCaptionedDubBtn" class="output-choice-card active" data-output-type="captioned_dub">
                                         <span class="structure-label">MP4</span>
                                         <strong>자막+더빙 영상</strong>
-                                        <small>자막과 더빙 음성을 함께 확인합니다.</small>
+                                        <small>생성된 MP3와 선택한 SRT를 함께 입힙니다.</small>
                                     </button>
                                 </div>
 
@@ -170,12 +529,68 @@
                                                 <option value="en">English</option>
                                             </select>
                                         </div>
+                                        <div id="srtSourceSettingGroup">
+                                            <label for="generationSrtSourceSelect">자막/SRT 소스</label>
+                                            <select id="generationSrtSourceSelect" class="api-key-input"></select>
+                                        </div>
+                                        <div id="audioArtifactSettingGroup" class="generation-wide hidden">
+                                            <label for="generationAudioArtifactSelect">사용할 MP3</label>
+                                            <select id="generationAudioArtifactSelect" class="api-key-input"></select>
+                                        </div>
                                         <div id="voiceSettingGroup">
-                                            <label for="generationVoiceSelect">더빙 음성</label>
+                                            <label for="generationTtsProviderSelect">음성 엔진</label>
+                                            <select id="generationTtsProviderSelect" class="api-key-input">
+                                                <option value="gemini">Gemini</option>
+                                            </select>
+                                        </div>
+                                        <div id="voiceNameSettingGroup">
+                                            <label for="generationVoiceSelect" class="label-with-info">
+                                                Gemini 음성
+                                                <span class="info-tooltip" id="generationGeminiVoiceInfo" role="button" tabindex="0" aria-expanded="false" aria-label="Gemini 음성 특징 보기">
+                                                    i
+                                                    <span class="info-tooltip-panel" id="generationGeminiVoiceTooltip"></span>
+                                                </span>
+                                            </label>
                                             <select id="generationVoiceSelect" class="api-key-input"></select>
+                                            <div class="voice-sample-row">
+                                                <audio id="generationGeminiVoiceSample" controls preload="none"></audio>
+                                                <span id="generationGeminiVoiceSampleStatus">샘플 준비 확인 중</span>
+                                            </div>
+                                        </div>
+                                        <div id="voiceToneSettingGroup">
+                                            <label for="generationToneSelect">Gemini 말투/톤</label>
+                                            <select id="generationToneSelect" class="api-key-input">
+                                                <option value="bright_natural">밝고 자연스럽게</option>
+                                                <option value="clear_lecture">명확한 강의 톤</option>
+                                                <option value="calm">차분하고 안정적으로</option>
+                                                <option value="energetic">에너지 있게</option>
+                                                <option value="custom">직접 입력</option>
+                                            </select>
+                                        </div>
+                                        <div id="voiceToneCustomGroup" class="generation-wide hidden">
+                                            <label for="generationToneCustomInput">직접 톤 지시</label>
+                                            <textarea id="generationToneCustomInput" class="api-key-input generation-tone-textarea" placeholder="예: 더 밝고 친근하게, 문장 끝을 자연스럽게 처리하고 과장되지 않게 읽기"></textarea>
                                         </div>
                                     </div>
-                                    <section id="subtitleStylePanel" class="subtitle-style-panel">
+                                    <div id="subtitlePresetPanel" class="subtitle-preset-panel">
+                                        <div class="subtitle-style-header">
+                                            <strong>사용할 자막 프리셋</strong>
+                                            <span>자막 영상과 자막+더빙 영상에 적용됩니다</span>
+                                        </div>
+                                        <div class="subtitle-preset-row">
+                                            <select id="subtitlePresetSelect" class="api-key-input"></select>
+                                            <input id="subtitlePresetNameInput" class="api-key-input" type="text" placeholder="새 프리셋 이름">
+                                            <button id="saveSubtitlePresetBtn" class="btn-toolbar" type="button">프리셋 저장</button>
+                                            <button id="deleteSubtitlePresetBtn" class="btn-toolbar danger" type="button">삭제</button>
+                                        </div>
+                                    </div>
+                                    <details id="subtitleStylePanel" class="subtitle-style-panel">
+                                        <summary class="subtitle-style-summary">
+                                            <span>
+                                                <strong>자막 디자인</strong>
+                                                <small>폰트, 위치, 색상, 배경, 테두리 조정</small>
+                                            </span>
+                                        </summary>
                                         <div class="subtitle-style-header">
                                             <strong>자막 디자인</strong>
                                             <span>생성 전에 실제 표시 느낌을 확인하세요</span>
@@ -243,7 +658,7 @@
                                                 </div>
                                             </div>
                                         </div>
-                                    </section>
+                                    </details>
                                 </section>
                             </section>
 
@@ -272,6 +687,71 @@
                             <audio id="mainPreviewAudio" controls></audio>
                         </div>
                     </div>
+                    <div class="tab-content" data-content="video_edit">
+                        <div class="video-edit-workflow">
+                            <section class="video-edit-card">
+                                <div class="production-section-header">
+                                    <p class="workflow-kicker">Cut</p>
+                                    <h3>현재 파일 자르기</h3>
+                                </div>
+                                <div class="video-edit-grid">
+                                    <label>
+                                        <span>시작 초</span>
+                                        <input id="trimStartSeconds" class="api-key-input" type="number" min="0" step="0.1" value="0">
+                                    </label>
+                                    <label>
+                                        <span>끝 초</span>
+                                        <input id="trimEndSeconds" class="api-key-input" type="number" min="0.1" step="0.1" placeholder="예: 12.5">
+                                    </label>
+                                    <button id="trimVideoBtn" class="btn-action primary" type="button">자른 영상 생성</button>
+                                </div>
+                            </section>
+
+                            <section class="video-edit-card">
+                                <div class="production-section-header">
+                                    <p class="workflow-kicker">Append / Intro</p>
+                                    <h3>다른 영상 붙이기</h3>
+                                </div>
+                                <div class="video-edit-grid">
+                                    <label>
+                                        <span>붙일 위치</span>
+                                        <select id="concatPositionSelect" class="api-key-input">
+                                            <option value="before">현재 파일 앞에 붙이기</option>
+                                            <option value="after" selected>현재 파일 뒤에 붙이기</option>
+                                            <option value="both">현재 파일 앞/뒤에 둘 다 붙이기</option>
+                                        </select>
+                                    </label>
+                                    <label>
+                                        <span>앞에 붙일 기존 파일</span>
+                                        <select id="concatExistingFileSelect" class="api-key-input"></select>
+                                    </label>
+                                    <label>
+                                        <span>뒤에 붙일 기존 파일</span>
+                                        <select id="concatAfterExistingFileSelect" class="api-key-input"></select>
+                                    </label>
+                                    <label class="generation-wide">
+                                        <span>앞에 붙일 새 영상 업로드</span>
+                                        <input id="concatUploadInput" class="api-key-input" type="file" accept=".mp4,.mov,.avi,.mkv,.webm">
+                                    </label>
+                                    <label class="generation-wide">
+                                        <span>뒤에 붙일 새 영상 업로드</span>
+                                        <input id="concatAfterUploadInput" class="api-key-input" type="file" accept=".mp4,.mov,.avi,.mkv,.webm">
+                                    </label>
+                                    <button id="concatVideoBtn" class="btn-action primary" type="button">붙인 영상 생성</button>
+                                </div>
+                                <p class="video-edit-note">앞/뒤 중 선택한 위치만 사용됩니다. 앞/뒤 둘 다 붙이기에서는 앞 소스와 뒤 소스를 각각 선택하세요. 새 영상을 선택하면 해당 위치의 기존 파일 선택보다 우선 사용됩니다.</p>
+                            </section>
+
+                            <section class="video-edit-card">
+                                <div class="production-section-header">
+                                    <p class="workflow-kicker">Preview</p>
+                                    <h3>원본 확인</h3>
+                                </div>
+                                <video id="editSourceVideoPlayer" class="artifact-player artifact-video-player" controls playsinline preload="metadata"></video>
+                                <p id="videoEditStatus" class="video-edit-status"></p>
+                            </section>
+                        </div>
+                    </div>
                     <div class="tab-content" data-content="artifacts">
                         <div id="modalArtifacts" class="artifact-list"></div>
                     </div>
@@ -282,8 +762,10 @@
                 </div>
             </div>
         </div>
+        </div>
     </div>
 
-    <script src="/static/script.js?v=subtitle-preview-2"></script>
+    <script src="/static/script.js?v=lecture-voice-preview-2"></script>
 </body>
 </html>
+

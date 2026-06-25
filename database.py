@@ -84,9 +84,32 @@ def init_db():
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS ai_usage_events (
+        id TEXT PRIMARY KEY,
+        file_id TEXT,
+        job_id TEXT,
+        artifact_id TEXT,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        characters INTEGER DEFAULT 0,
+        request_count INTEGER DEFAULT 1,
+        estimated_cost_usd REAL DEFAULT 0,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL
+    )
+    ''')
     
     # 검색을 위한 인덱스 생성
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_filename ON files(filename)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ai_usage_created_at ON ai_usage_events(created_at)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ai_usage_file_id ON ai_usage_events(file_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ai_usage_job_id ON ai_usage_events(job_id)')
     
     conn.commit()
     
@@ -247,6 +270,34 @@ def get_artifacts_for_file(file_id: str) -> List[Dict]:
         results.append(item)
     return results
 
+def get_all_artifacts() -> List[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT artifacts.*, files.filename AS source_filename
+    FROM artifacts
+    LEFT JOIN files ON files.id = artifacts.file_id
+    ORDER BY artifacts.created_at DESC
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["metadata"] = json.loads(item.get("metadata") or "{}")
+        results.append(item)
+    return results
+
+def delete_artifact(artifact_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM artifacts WHERE id = ?', (artifact_id,))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
 def attach_artifact_summary(file: Dict) -> Dict:
     artifacts = get_artifacts_for_file(file["id"])
     file["artifacts"] = artifacts
@@ -315,6 +366,136 @@ def get_jobs(file_id: Optional[str] = None) -> List[Dict]:
     rows = cursor.fetchall()
     conn.close()
     return [_job_from_row(row) for row in rows]
+
+def create_ai_usage_event(
+    provider: str,
+    model: str,
+    operation: str,
+    file_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    artifact_id: Optional[str] = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    characters: int = 0,
+    request_count: int = 1,
+    estimated_cost_usd: float = 0.0,
+    metadata: Optional[Dict] = None,
+) -> Dict:
+    event_id = str(uuid.uuid4())
+    created_at = datetime.now().isoformat()
+    metadata = metadata or {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO ai_usage_events (
+        id, file_id, job_id, artifact_id, provider, model, operation,
+        input_tokens, output_tokens, total_tokens, characters, request_count,
+        estimated_cost_usd, metadata, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        event_id,
+        file_id,
+        job_id,
+        artifact_id,
+        provider,
+        model,
+        operation,
+        int(input_tokens or 0),
+        int(output_tokens or 0),
+        int(total_tokens or 0),
+        int(characters or 0),
+        int(request_count or 0),
+        float(estimated_cost_usd or 0),
+        json.dumps(metadata, ensure_ascii=False),
+        created_at,
+    ))
+    conn.commit()
+    conn.close()
+    return {
+        "id": event_id,
+        "file_id": file_id,
+        "job_id": job_id,
+        "artifact_id": artifact_id,
+        "provider": provider,
+        "model": model,
+        "operation": operation,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "total_tokens": int(total_tokens or 0),
+        "characters": int(characters or 0),
+        "request_count": int(request_count or 0),
+        "estimated_cost_usd": float(estimated_cost_usd or 0),
+        "metadata": metadata,
+        "created_at": created_at,
+    }
+
+def _ai_usage_where(start_at: Optional[str] = None, end_at: Optional[str] = None):
+    clauses = []
+    params = []
+    if start_at:
+        clauses.append("created_at >= ?")
+        params.append(start_at)
+    if end_at:
+        clauses.append("created_at < ?")
+        params.append(end_at)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def list_ai_usage_events(limit: int = 200, start_at: Optional[str] = None, end_at: Optional[str] = None) -> List[Dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    where_sql, params = _ai_usage_where(start_at, end_at)
+    cursor.execute(
+        f'SELECT * FROM ai_usage_events{where_sql} ORDER BY created_at DESC LIMIT ?',
+        [*params, max(1, min(int(limit or 200), 1000))]
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["metadata"] = json.loads(item.get("metadata") or "{}")
+        results.append(item)
+    return results
+
+def summarize_ai_usage(start_at: Optional[str] = None, end_at: Optional[str] = None) -> Dict:
+    conn = get_connection()
+    cursor = conn.cursor()
+    where_sql, params = _ai_usage_where(start_at, end_at)
+    cursor.execute(f'''
+    SELECT
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(characters), 0) AS characters,
+        COALESCE(SUM(request_count), 0) AS request_count,
+        COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+        COUNT(*) AS event_count
+    FROM ai_usage_events
+    {where_sql}
+    ''', params)
+    total = dict(cursor.fetchone())
+    cursor.execute(f'''
+    SELECT
+        provider,
+        operation,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(characters), 0) AS characters,
+        COALESCE(SUM(request_count), 0) AS request_count,
+        COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+        COUNT(*) AS event_count
+    FROM ai_usage_events
+    {where_sql}
+    GROUP BY provider, operation
+    ORDER BY estimated_cost_usd DESC, event_count DESC
+    ''', params)
+    by_operation = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return {"total": total, "by_operation": by_operation}
 
 def attach_job_summary(file: Dict) -> Dict:
     jobs = get_jobs(file["id"])

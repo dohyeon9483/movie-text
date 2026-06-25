@@ -26,6 +26,8 @@ uploads/
 media/
 outputs/
 thumbnails/
+samples/
+output_script_*/
 recording_*.mp4
 recording_*.wav
 *.mp4
@@ -37,6 +39,9 @@ recording_*.wav
 *.avi
 *.mov
 *.mkv
+!assets/
+!assets/video_editor/
+!assets/video_editor/LogoIntro.mp4
 test_text.txt
 test*.mp4
 test*.txt
@@ -55,6 +60,8 @@ desktop.ini
 
 # Logs
 *.log
+server_*.txt
+*_log.txt
 
 # Distribution / packaging
 dist/
