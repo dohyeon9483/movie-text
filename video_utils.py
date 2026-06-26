@@ -1,10 +1,14 @@
 import json
+import os
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from fastapi import HTTPException
+
+VIDEO_TRANSCODE_PRESET = os.getenv("AI_VIDEO_TRANSCODE_PRESET", "medium")
+VIDEO_TRANSCODE_CRF = os.getenv("AI_VIDEO_TRANSCODE_CRF", "18")
 
 
 def generate_video_thumbnail(video_path: Path, output_path: Path) -> bool:
@@ -35,11 +39,24 @@ def create_black_video(duration_ms: int, output_path: Path) -> None:
         raise HTTPException(status_code=500, detail=f"black video generation failed: {result.stderr[-1000:]}")
 
 
-def create_slide_segment(slide_path: Path, duration_seconds: float, output_path: Path, fade_seconds: float = 0.35) -> None:
+def create_slide_segment(
+    slide_path: Path,
+    duration_seconds: float,
+    output_path: Path,
+    fade_seconds: float = 0.35,
+    target_width: int = 1920,
+    target_height: int = 1080,
+) -> None:
     duration = max(float(duration_seconds or 0), 0.1)
     fade = min(max(float(fade_seconds or 0), 0.0), max((duration - 0.05) / 2, 0.0))
     fade_out_start = max(duration - fade, 0.0)
-    video_filter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
+    target_width = max(2, int(target_width) - (int(target_width) % 2))
+    target_height = max(2, int(target_height) - (int(target_height) % 2))
+    video_filter = (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,"
+        "setsar=1,format=yuv420p"
+    )
     if fade > 0.01:
         video_filter = f"{video_filter},fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out_start:.3f}:d={fade:.3f}"
     command = [
@@ -51,8 +68,8 @@ def create_slide_segment(slide_path: Path, duration_seconds: float, output_path:
         "-r", "30",
         "-an",
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", VIDEO_TRANSCODE_PRESET,
+        "-crf", VIDEO_TRANSCODE_CRF,
         str(output_path.resolve()),
     ]
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -86,6 +103,21 @@ def media_duration_seconds(path: Path) -> float:
         return 0.1
 
 
+def media_video_dimensions(path: Path) -> Tuple[int, int]:
+    info = ffprobe_json(path)
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        try:
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width > 0 and height > 0:
+            return width - (width % 2), height - (height % 2)
+    return 1280, 720
+
+
 def has_audio_stream(path: Path) -> bool:
     info = ffprobe_json(path)
     return any(stream.get("codec_type") == "audio" for stream in info.get("streams", []))
@@ -113,9 +145,15 @@ def trim_video_file(source_path: Path, output_path: Path, start_seconds: float, 
         raise HTTPException(status_code=500, detail=f"trim failed: {result.stderr[-1000:]}")
 
 
-def normalize_video_for_concat(source_path: Path, output_path: Path) -> None:
+def normalize_video_for_concat(source_path: Path, output_path: Path, target_width: int, target_height: int) -> None:
     duration = media_duration_seconds(source_path)
-    video_filter = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+    target_width = max(2, int(target_width) - (int(target_width) % 2))
+    target_height = max(2, int(target_height) - (int(target_height) % 2))
+    video_filter = (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,fps=24,format=yuv420p"
+    )
     if has_audio_stream(source_path):
         command = [
             "ffmpeg", "-y",
@@ -124,8 +162,8 @@ def normalize_video_for_concat(source_path: Path, output_path: Path) -> None:
             "-map", "0:v:0",
             "-map", "0:a:0",
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
+            "-preset", VIDEO_TRANSCODE_PRESET,
+            "-crf", VIDEO_TRANSCODE_CRF,
             "-c:a", "aac",
             "-ar", "44100",
             "-ac", "2",
@@ -143,8 +181,8 @@ def normalize_video_for_concat(source_path: Path, output_path: Path) -> None:
             "-map", "0:v:0",
             "-map", "1:a:0",
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
+            "-preset", VIDEO_TRANSCODE_PRESET,
+            "-crf", VIDEO_TRANSCODE_CRF,
             "-c:a", "aac",
             "-shortest",
             str(output_path),
@@ -164,8 +202,9 @@ def concat_video_sequence(source_paths: List[Path], output_path: Path, temp_dir:
     temp_paths = [temp_dir / f"concat_{index}_{uuid.uuid4().hex}.mp4" for index, _ in enumerate(source_paths)]
     concat_list = temp_dir / f"concat_{uuid.uuid4().hex}.txt"
     try:
+        target_width, target_height = media_video_dimensions(source_paths[0])
         for source_path, temp_path in zip(source_paths, temp_paths):
-            normalize_video_for_concat(source_path, temp_path)
+            normalize_video_for_concat(source_path, temp_path, target_width, target_height)
         concat_list.write_text(
             "".join(f"file '{path.resolve().as_posix()}'\n" for path in temp_paths),
             encoding="utf-8",

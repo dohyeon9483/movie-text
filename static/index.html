@@ -155,7 +155,7 @@
                 <div>
                     <p class="workflow-kicker">Lecture slides</p>
                     <h2>강의 슬라이드 영상 생성</h2>
-                    <p class="section-desc">슬라이드 이미지와 장표별 대본 엑셀을 업로드해 생성 음성 길이에 맞춘 강의 영상을 만듭니다.</p>
+                    <p class="section-desc">슬라이드 이미지, HTML, PDF 장표와 장표별 대본 엑셀을 업로드해 생성 음성 길이에 맞춘 강의 영상을 만듭니다.</p>
                 </div>
                 <div class="board-actions">
                     <a class="btn-toolbar primary" href="/api/lecture-projects/template" download>엑셀 템플릿 다운로드</a>
@@ -165,8 +165,8 @@
             <section class="lecture-project-panel">
                 <div class="lecture-project-grid">
                     <label>
-                        <span>슬라이드 이미지</span>
-                        <input id="lectureSlidesInput" class="api-key-input" type="file" accept=".png,.jpg,.jpeg" multiple>
+                        <span>슬라이드 파일</span>
+                        <input id="lectureSlidesInput" class="api-key-input" type="file" accept=".png,.jpg,.jpeg,.html,.htm,.pdf,text/html,application/pdf" multiple>
                     </label>
                     <label>
                         <span>장표별 대본 엑셀</span>
@@ -220,6 +220,114 @@
                     <span id="lectureProjectStatus" class="video-edit-status"></span>
                 </div>
                 <div id="lectureValidationResult" class="lecture-validation-result hidden"></div>
+            </section>
+        </section>
+
+        <section id="aiVideoProjectSection" class="board-section hidden">
+            <section class="board-toolbar">
+                <div>
+                    <p class="workflow-kicker">AI video</p>
+                    <h2>AI 영상 생성</h2>
+                    <p class="section-desc">주제를 입력하면 숏츠 초안을 만들고, 장면별 Veo 영상과 내레이션/자막을 합성합니다.</p>
+                </div>
+            </section>
+
+            <section class="lecture-project-panel">
+                <div class="lecture-project-grid">
+                    <label class="wide-field">
+                        <span>영상 주제 또는 기획안</span>
+                        <textarea id="aiVideoTopicInput" class="api-key-input" rows="4" placeholder="예: 생성형 AI가 업무 보고서를 바꾸는 방식&#10;또는 씬별 대사/영상 프롬프트가 포함된 숏츠 기획안"></textarea>
+                    </label>
+                    <label>
+                        <span>언어</span>
+                        <select id="aiVideoLanguageSelect" class="api-key-input">
+                            <option value="ko">한국어</option>
+                            <option value="en">English</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>목표 길이</span>
+                        <select id="aiVideoDurationSelect" class="api-key-input">
+                            <option value="1-3분" selected>1~3분 숏폼</option>
+                            <option value="3-5분">3~5분 설명 영상</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>대상</span>
+                        <input id="aiVideoAudienceInput" class="api-key-input" type="text" value="일반 시청자">
+                    </label>
+                    <label>
+                        <span>톤</span>
+                        <select id="aiVideoToneSelect" class="api-key-input">
+                            <option value="명확하고 자연스럽게" selected>명확하고 자연스럽게</option>
+                            <option value="밝고 빠르게">밝고 빠르게</option>
+                            <option value="차분한 다큐멘터리 톤">차분한 다큐멘터리 톤</option>
+                            <option value="전문 강의 톤">전문 강의 톤</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>화면 비율</span>
+                        <select id="aiVideoAspectRatioSelect" class="api-key-input">
+                            <option value="9:16" selected>9:16 쇼츠</option>
+                            <option value="16:9">16:9 가로</option>
+                            <option value="1:1">1:1 정사각형</option>
+                            <option value="4:3">4:3</option>
+                            <option value="3:4">3:4</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>스타일 프리셋</span>
+                        <select id="aiVideoImageStylePresetSelect" class="api-key-input">
+                            <option value="clean modern editorial illustration, cinematic lighting" selected>모던 일러스트</option>
+                            <option value="cinematic realistic video, shallow depth of field, natural lighting">시네마틱 실사</option>
+                            <option value="bright Korean short-form commercial style, energetic, polished">밝은 숏폼 광고</option>
+                            <option value="minimal 3D isometric style, soft studio lighting">미니멀 3D</option>
+                            <option value="documentary style, handheld camera feel, realistic environment">다큐멘터리</option>
+                            <option value="custom">직접 입력</option>
+                        </select>
+                    </label>
+                    <label class="wide-field">
+                        <span>스타일 직접 입력</span>
+                        <input id="aiVideoImageStyleInput" class="api-key-input" type="text" value="clean modern editorial illustration, cinematic lighting">
+                    </label>
+                    <label class="wide-field">
+                        <span>캐릭터 이미지</span>
+                        <input id="aiVideoCharacterInput" class="api-key-input" type="file" accept=".png,.jpg,.jpeg" multiple>
+                        <small>기본 캐릭터 에셋: 오르, 삐야</small>
+                    </label>
+                    <label>
+                        <span>영상 방식</span>
+                        <select id="aiVideoVisualModeSelect" class="api-key-input">
+                            <option value="veo" selected>Veo 쇼츠</option>
+                            <option value="image">이미지+내레이션</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>최종 산출물</span>
+                        <select id="aiVideoOutputSelect" class="api-key-input">
+                            <option value="captioned_dub_video" selected>자막+더빙 영상</option>
+                            <option value="dub_video">더빙 영상</option>
+                            <option value="subtitle_video">자막 영상</option>
+                            <option value="audio">음성 MP3</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>음성 엔진</span>
+                        <select id="aiVideoProviderSelect" class="api-key-input">
+                            <option value="gemini">Gemini</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span>음성</span>
+                        <select id="aiVideoVoiceSelect" class="api-key-input"></select>
+                    </label>
+                </div>
+                <div class="lecture-project-actions">
+                    <button id="aiVideoDraftBtn" class="btn-action primary" type="button">초안 생성</button>
+                    <button id="aiVideoCreateBtn" class="btn-action primary" type="button" disabled>영상 생성</button>
+                    <span id="aiVideoProjectStatus" class="video-edit-status"></span>
+                </div>
+                <div id="aiVideoDraftPanel" class="ai-video-draft-panel hidden"></div>
             </section>
         </section>
 
@@ -765,7 +873,7 @@
         </div>
     </div>
 
-    <script src="/static/script.js?v=lecture-voice-preview-2"></script>
+    <script src="/static/script.js?v=ai-video-character-assets-1"></script>
 </body>
 </html>
 

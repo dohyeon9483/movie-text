@@ -9,6 +9,8 @@ import tempfile
 import wave
 import io
 import zipfile
+import time
+import shutil
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Callable, Awaitable, Any
@@ -22,6 +24,9 @@ import ai_usage
 import database as db
 from openpyxl import Workbook
 from lecture_timeline import (
+    LECTURE_HTML_SLIDE_EXTENSIONS,
+    LECTURE_IMAGE_SLIDE_EXTENSIONS,
+    LECTURE_PDF_SLIDE_EXTENSIONS,
     LECTURE_SLIDE_EXTENSIONS,
     create_lecture_timeline_template,
     parse_lecture_timeline_xlsx,
@@ -284,6 +289,53 @@ class ScriptJobRequest(BaseModel):
     script: str
     language: str = "ko"
 
+class AiVideoDraftRequest(BaseModel):
+    topic: str
+    language: str = "ko"
+    target_duration: str = "1-3분"
+    audience: str = "일반 시청자"
+    tone: str = "명확하고 자연스럽게"
+    image_style: str = "clean modern editorial illustration, cinematic lighting"
+    aspect_ratio: Optional[str] = None
+    character_names: Optional[List[str]] = None
+
+
+class AiVideoSceneRequest(BaseModel):
+    scene_no: int
+    script: str
+    image_prompt: Optional[str] = ""
+    visual_notes: Optional[str] = ""
+    scene_kind: Optional[str] = "veo_clip"
+    audio_mode: Optional[str] = "narrator"
+    video_prompt: Optional[str] = ""
+    dialogue: Optional[str] = ""
+    sound_design: Optional[str] = ""
+    subtitle_text: Optional[str] = ""
+    duration_seconds: Optional[float] = 5.0
+    character_usage: Optional[List[str]] = None
+    character_role: Optional[str] = ""
+
+
+class AiVideoCreateRequest(BaseModel):
+    draft_id: Optional[str] = None
+    title: Optional[str] = None
+    topic: Optional[str] = None
+    language: str = "ko"
+    target_duration: str = "1-3분"
+    audience: str = "일반 시청자"
+    tone: str = "명확하고 자연스럽게"
+    image_style: str = "clean modern editorial illustration, cinematic lighting"
+    aspect_ratio: Optional[str] = None
+    character_assets: Optional[List[Dict]] = None
+    scenes: Optional[List[AiVideoSceneRequest]] = None
+    visual_mode: Optional[str] = None
+    visual_provider: Optional[str] = None
+    final_output: str = "captioned_dub_video"
+    tts_provider: Optional[str] = None
+    voice_name: Optional[str] = None
+    style_prompt: Optional[str] = None
+    subtitle_style: Optional[SubtitleStyleRequest] = None
+
 class JobRequest(BaseModel):
     language: str = "ko"
     voice_name: Optional[str] = None
@@ -331,6 +383,47 @@ def default_gemini_tts_model() -> str:
 
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", default_gemini_tts_model())
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "google_cloud").lower()
+AI_VIDEO_VISUAL_PROVIDER = os.getenv("AI_VIDEO_VISUAL_PROVIDER", "nano_banana").lower()
+AI_VIDEO_VISUAL_MODE = os.getenv("AI_VIDEO_VISUAL_MODE", "veo").lower()
+NANO_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", "gemini-2.5-flash-image")
+NANO_BANANA_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "NANO_BANANA_MODELS",
+        f"{NANO_BANANA_MODEL},gemini-3.1-flash-image,gemini-3.1-flash-image-preview,gemini-3-pro-image,gemini-2.5-flash-image-preview",
+    ).split(",")
+    if model.strip()
+]
+AI_VIDEO_IMAGE_LOCATION = os.getenv("AI_VIDEO_IMAGE_LOCATION", "global")
+AI_VIDEO_IMAGE_API_VERSION = os.getenv("AI_VIDEO_IMAGE_API_VERSION", "")
+VEO_MODEL = os.getenv("VEO_MODEL", "veo-3.1-fast-generate-001")
+VEO_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "VEO_MODELS",
+        f"{VEO_MODEL},veo-3.1-generate-001",
+    ).split(",")
+    if model.strip()
+]
+VEO_LOCATION = os.getenv("VEO_LOCATION", "us-central1")
+VEO_API_VERSION = os.getenv("VEO_API_VERSION", "")
+VEO_ASPECT_RATIO = os.getenv("VEO_ASPECT_RATIO", "9:16")
+VEO_RESOLUTION = os.getenv("VEO_RESOLUTION", "720p")
+AI_VIDEO_TRANSCODE_PRESET = os.getenv("AI_VIDEO_TRANSCODE_PRESET", "medium")
+AI_VIDEO_TRANSCODE_CRF = os.getenv("AI_VIDEO_TRANSCODE_CRF", "18")
+VEO_DEFAULT_DURATION_SECONDS = float(os.getenv("VEO_DEFAULT_DURATION_SECONDS", "5"))
+VEO_MAX_DURATION_SECONDS = float(os.getenv("VEO_MAX_DURATION_SECONDS", "8"))
+VEO_POLL_INTERVAL_SECONDS = float(os.getenv("VEO_POLL_INTERVAL_SECONDS", "10"))
+VEO_MAX_WAIT_SECONDS = float(os.getenv("VEO_MAX_WAIT_SECONDS", "900"))
+IMAGEN_MODEL = os.getenv("IMAGEN_MODEL", "imagen-3.0-generate-002")
+AI_VIDEO_DEFAULT_SCENE_COUNT = int(os.getenv("AI_VIDEO_DEFAULT_SCENE_COUNT", "10"))
+AI_VIDEO_MAX_SCENE_COUNT = int(os.getenv("AI_VIDEO_MAX_SCENE_COUNT", "12"))
+AI_VIDEO_IMAGE_ASPECT_RATIO = os.getenv("AI_VIDEO_IMAGE_ASPECT_RATIO", "16:9")
+AI_VIDEO_ALLOW_TEXT_FALLBACK = os.getenv("AI_VIDEO_ALLOW_TEXT_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
+AI_VIDEO_DRAFTS: Dict[str, Dict] = {}
+ASPECT_RATIO_RE = re.compile(r"(?<!\d)(1:1|9:16|16:9|4:3|3:4)(?!\d)")
+VEO_SUPPORTED_ASPECT_RATIOS = {"9:16", "16:9"}
+IMAGE_SUPPORTED_ASPECT_RATIOS = {"1:1", "9:16", "16:9", "4:3", "3:4"}
 
 
 def get_service_account_project_id() -> Optional[str]:
@@ -450,6 +543,54 @@ def generate_gemini_text(prompt: str, operation: str = "gemini_text") -> str:
     return text
 
 
+def create_gemini_image_client() -> Any:
+    if google_genai is None:
+        raise RuntimeError("google-genai package is not installed.")
+    if GEMINI_PROVIDER in {"vertex_ai", "vertex", "google_cloud"}:
+        project = get_google_cloud_project()
+        if not project:
+            raise RuntimeError("GOOGLE_CLOUD_PROJECT or service account project_id is required for Vertex AI image generation.")
+        http_options = (
+            google_genai_types.HttpOptions(apiVersion=AI_VIDEO_IMAGE_API_VERSION)
+            if google_genai_types and AI_VIDEO_IMAGE_API_VERSION
+            else None
+        )
+        return google_genai.Client(
+            vertexai=True,
+            project=project,
+            location=AI_VIDEO_IMAGE_LOCATION,
+            http_options=http_options,
+        )
+    if gemini_tts_client:
+        return gemini_tts_client
+    if gemini_api_key:
+        return google_genai.Client(api_key=gemini_api_key)
+    raise RuntimeError("Gemini image client is not configured.")
+
+
+def create_veo_client() -> Any:
+    if google_genai is None:
+        raise RuntimeError("google-genai package is not installed.")
+    if GEMINI_PROVIDER in {"vertex_ai", "vertex", "google_cloud"}:
+        project = get_google_cloud_project()
+        if not project:
+            raise RuntimeError("GOOGLE_CLOUD_PROJECT or service account project_id is required for Veo generation.")
+        http_options = (
+            google_genai_types.HttpOptions(apiVersion=VEO_API_VERSION)
+            if google_genai_types and VEO_API_VERSION
+            else None
+        )
+        return google_genai.Client(
+            vertexai=True,
+            project=project,
+            location=VEO_LOCATION,
+            http_options=http_options,
+        )
+    if gemini_api_key:
+        return google_genai.Client(api_key=gemini_api_key)
+    raise RuntimeError("Veo client is not configured.")
+
+
 initialize_gemini_from_env()
 
 # 디렉토리 생성
@@ -459,9 +600,29 @@ MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
-VOICE_SAMPLE_DIR = OUTPUT_DIR / "voice_samples"
-VOICE_SAMPLE_DIR.mkdir(exist_ok=True)
+AI_CHARACTER_ASSET_DIR = MEDIA_DIR / "ai_character_assets"
+AI_CHARACTER_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_AI_CHARACTER_ASSET_PATH = Path(os.getenv("AI_VIDEO_DEFAULT_CHARACTER_ASSET", str(AI_CHARACTER_ASSET_DIR / "캐릭터 에셋.png")))
+DEFAULT_AI_CHARACTER_NAME = os.getenv("AI_VIDEO_DEFAULT_CHARACTER_NAME", "캐릭터 에셋")
+DEFAULT_AI_CHARACTER_DESCRIPTION = os.getenv(
+    "AI_VIDEO_DEFAULT_CHARACTER_DESCRIPTION",
+    "A character reference sheet with a yellow chick mascot and a white bear mascot wearing a blue AI headband, shown from multiple angles and with facial expressions.",
+)
+DEFAULT_AI_CHARACTER_ASSETS = [
+    {
+        "name": "오르",
+        "filename": "오르.png",
+        "description": "Reference sheet for Or, a white bear character with multiple angles and facial expressions.",
+    },
+    {
+        "name": "삐야",
+        "filename": "삐야.png",
+        "description": "Reference sheet for Ppiya, a yellow chick character with multiple angles and poses.",
+    },
+]
 ASSET_DIR = Path("assets")
+VOICE_SAMPLE_DIR = ASSET_DIR / "voice_samples"
+VOICE_SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_EDITOR_ASSET_DIR = ASSET_DIR / "video_editor"
 VIDEO_EDITOR_ASSET_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_LOGO_INTRO_PATH = VIDEO_EDITOR_ASSET_DIR / "LogoIntro.mp4"
@@ -954,7 +1115,7 @@ CLOUD_TTS_VOICES = [
     {"name": "en-US-Neural2-F", "label": "en-US-Neural2-F", "language_code": "en-US"},
 ]
 
-VOICE_SAMPLE_TEXT = "안녕하세요? 반갑습니다. 저는 AI 말하기 모델입니다!\nHello? Nice to meet you. I'm an AI speech model!"
+VOICE_SAMPLE_TEXT = "안녕하세요? 저는 AI 모델입니다. Hello? I am AI Speech Model"
 VOICE_SAMPLE_STYLE_PROMPT = "Read this short Korean and English voice sample naturally, clearly, and warmly."
 
 
@@ -1078,6 +1239,29 @@ def default_voice_for_language(language: str, tts_provider: Optional[str] = None
         if voice.get(default_key):
             return voice["name"]
     return voices[0]["name"]
+
+
+def extract_aspect_ratio_from_text(text: str) -> Optional[str]:
+    match = ASPECT_RATIO_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def resolve_ai_video_aspect_ratio(image_style: str, visual_mode: Optional[str] = None, aspect_ratio: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    requested = aspect_ratio if aspect_ratio in (IMAGE_SUPPORTED_ASPECT_RATIOS | VEO_SUPPORTED_ASPECT_RATIOS) else None
+    requested = requested or extract_aspect_ratio_from_text(image_style)
+    mode = normalize_ai_video_visual_mode(visual_mode)
+    if mode == "veo":
+        if requested in VEO_SUPPORTED_ASPECT_RATIOS:
+            return requested, None
+        if requested:
+            return VEO_ASPECT_RATIO if VEO_ASPECT_RATIO in VEO_SUPPORTED_ASPECT_RATIOS else "9:16", (
+                f"Veo supports only 9:16 and 16:9. Requested {requested} was mapped to "
+                f"{VEO_ASPECT_RATIO if VEO_ASPECT_RATIO in VEO_SUPPORTED_ASPECT_RATIOS else '9:16'}."
+            )
+        return VEO_ASPECT_RATIO if VEO_ASPECT_RATIO in VEO_SUPPORTED_ASPECT_RATIOS else "9:16", None
+    if requested in IMAGE_SUPPORTED_ASPECT_RATIOS:
+        return requested, None
+    return AI_VIDEO_IMAGE_ASPECT_RATIO, None
 
 
 def sanitize_output_name(filename: str) -> str:
@@ -1573,6 +1757,27 @@ def mux_video_with_audio(video_path: Path, audio_path: Path, output_path: Path) 
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr[-1000:]}")
 
 
+def pad_or_trim_video_to_duration(video_path: Path, duration_seconds: float, output_path: Path) -> None:
+    duration = max(float(duration_seconds or 0), 0.1)
+    command = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", str(video_path),
+        "-t", f"{duration:.3f}",
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", AI_VIDEO_TRANSCODE_PRESET,
+        "-crf", AI_VIDEO_TRANSCODE_CRF,
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"video duration normalization failed: {result.stderr[-1000:]}")
+
+
 def media_type_for_path(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".mp4", ".m4v", ".mov"}:
@@ -1657,9 +1862,14 @@ def normalize_subtitle_style(style: Optional[SubtitleStyleRequest]) -> Dict:
     }
 
 
-def build_ass_subtitles(srt_text: str, style: Optional[SubtitleStyleRequest] = None) -> Tuple[str, Dict]:
+def build_ass_subtitles(
+    srt_text: str,
+    style: Optional[SubtitleStyleRequest] = None,
+    play_res: Optional[Tuple[int, int]] = None,
+) -> Tuple[str, Dict]:
     cues = parse_srt(srt_text)
     normalized = normalize_subtitle_style(style)
+    play_res_x, play_res_y = play_res or (1920, 1080)
     alignment = {"bottom": 2, "middle": 5, "top": 8}[normalized["position"]]
     background_active = normalized["background_enabled"] and normalized["background_opacity"] > 0
     border_style = 3 if background_active else 1
@@ -1693,8 +1903,8 @@ def build_ass_subtitles(srt_text: str, style: Optional[SubtitleStyleRequest] = N
     ass_text = "\n".join([
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 1920",
-        "PlayResY: 1080",
+        f"PlayResX: {play_res_x}",
+        f"PlayResY: {play_res_y}",
         "WrapStyle: 0",
         "ScaledBorderAndShadow: yes",
         "",
@@ -1713,7 +1923,8 @@ def build_ass_subtitles(srt_text: str, style: Optional[SubtitleStyleRequest] = N
 def burn_subtitles_into_video(source_video_path: Path, srt_text: str, output_path: Path, subtitle_style: Optional[SubtitleStyleRequest] = None) -> Dict:
     temp_ass_path = OUTPUT_DIR / f"subtitle_{uuid.uuid4().hex}.ass"
     try:
-        ass_text, normalized_style = build_ass_subtitles(srt_text, subtitle_style)
+        play_res = video_utils.media_video_dimensions(source_video_path)
+        ass_text, normalized_style = build_ass_subtitles(srt_text, subtitle_style, play_res=play_res)
         temp_ass_path.write_text(ass_text, encoding="utf-8")
         subtitle_filter = f"subtitles={temp_ass_path.name}"
         command = [
@@ -1721,9 +1932,10 @@ def burn_subtitles_into_video(source_video_path: Path, srt_text: str, output_pat
             "-i", str(source_video_path.resolve()),
             "-vf", subtitle_filter,
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
+            "-preset", AI_VIDEO_TRANSCODE_PRESET,
+            "-crf", AI_VIDEO_TRANSCODE_CRF,
             "-c:a", "copy",
+            "-movflags", "+faststart",
             str(output_path.resolve()),
         ]
         result = subprocess.run(command, cwd=str(OUTPUT_DIR.resolve()), capture_output=True, text=True)
@@ -2004,6 +2216,1151 @@ def create_black_video(duration_ms: int, output_path: Path) -> None:
 LECTURE_SLIDE_FADE_SECONDS = float(os.getenv("LECTURE_SLIDE_FADE_SECONDS", "0"))
 LECTURE_SLIDE_SPEECH_PADDING_SECONDS = float(os.getenv("LECTURE_SLIDE_SPEECH_PADDING_SECONDS", "0.45"))
 LECTURE_SLIDE_TRANSITION_SECONDS = float(os.getenv("LECTURE_SLIDE_TRANSITION_SECONDS", "0.4"))
+LECTURE_HTML_RENDER_WIDTH = int(os.getenv("LECTURE_HTML_RENDER_WIDTH", "1920"))
+LECTURE_HTML_RENDER_HEIGHT = int(os.getenv("LECTURE_HTML_RENDER_HEIGHT", "1080"))
+LECTURE_HTML_MAX_AUTO_REFS = int(os.getenv("LECTURE_HTML_MAX_AUTO_REFS", "200"))
+
+
+def split_html_slide_reference(slide_file: str) -> Tuple[str, Optional[int]]:
+    text = safe_upload_filename(slide_file or "")
+    if "#" not in text:
+        return text, None
+    filename, raw_index = text.rsplit("#", 1)
+    filename = safe_upload_filename(filename)
+    try:
+        slide_index = int(raw_index)
+    except (TypeError, ValueError):
+        return text, None
+    if slide_index < 1:
+        return text, None
+    return filename, slide_index
+
+
+def lecture_available_slide_references(uploaded_filenames: List[str]) -> List[str]:
+    refs: List[str] = []
+    for filename in uploaded_filenames:
+        refs.append(filename)
+        if Path(filename).suffix.lower() in LECTURE_HTML_SLIDE_EXTENSIONS | LECTURE_PDF_SLIDE_EXTENSIONS:
+            refs.extend(f"{filename}#{index}" for index in range(1, LECTURE_HTML_MAX_AUTO_REFS + 1))
+    return refs
+
+
+def can_auto_map_missing_slides_to_single_document(validation: Dict, uploaded_filenames: List[str]) -> bool:
+    document_files = [
+        name for name in uploaded_filenames
+        if Path(name).suffix.lower() in LECTURE_HTML_SLIDE_EXTENSIONS | LECTURE_PDF_SLIDE_EXTENSIONS
+    ]
+    image_files = [
+        name for name in uploaded_filenames
+        if Path(name).suffix.lower() in LECTURE_IMAGE_SLIDE_EXTENSIONS
+    ]
+    if len(document_files) != 1 or image_files:
+        return False
+    errors = validation.get("errors") or []
+    if not errors:
+        return False
+    return all("slide_file" in error and "was not uploaded" in error for error in errors)
+
+
+def build_single_document_slide_aliases(validation: Dict, document_filename: str) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    for item in validation.get("items") or []:
+        slide_file = safe_upload_filename(str(item.get("slide_file") or ""))
+        slide_no = item.get("slide_no")
+        if not slide_file or not isinstance(slide_no, int) or slide_no < 1:
+            continue
+        aliases[slide_file] = f"{document_filename}#{slide_no}"
+    return aliases
+
+
+def rendered_document_slide_output_name(source_filename: str, slide_index: Optional[int]) -> str:
+    stem = Path(source_filename).stem or "slide"
+    suffix = f"_{slide_index:03d}" if slide_index else "_001"
+    return f"{stem}{suffix}.png"
+
+
+async def render_html_slide_refs(html_path: Path, requested_refs: List[str], output_dir: Path) -> Dict[str, str]:
+    try:
+        from playwright.async_api import Error as PlaywrightError
+        from playwright.async_api import async_playwright
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "HTML slide rendering requires Playwright. "
+                "Install it with 'pip install playwright' and 'python -m playwright install chromium'."
+            ),
+        ) from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    html_filename = html_path.name
+    refs = list(dict.fromkeys(requested_refs))
+    rendered: Dict[str, str] = {}
+    render_script = """
+        async ({ targetIndex, width, height }) => {
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            if (document.fonts?.ready) {
+                try { await document.fonts.ready; } catch {}
+            }
+            const allSlides = Array.from(document.querySelectorAll("section.slide, .slide, [data-slide]"));
+            const slides = allSlides.filter((slide) => !allSlides.some((other) => other !== slide && other.contains(slide)));
+            document.documentElement.style.width = `${width}px`;
+            document.documentElement.style.height = `${height}px`;
+            document.body.style.width = `${width}px`;
+            document.body.style.height = `${height}px`;
+            document.body.style.margin = "0";
+            document.body.style.overflow = "hidden";
+            let target = document.body;
+            if (slides.length) {
+                if (targetIndex < 0 || targetIndex >= slides.length) {
+                    return { ok: false, slideCount: slides.length };
+                }
+                slides.forEach((slide, index) => {
+                    const isTarget = index === targetIndex;
+                    slide.classList.toggle("active", isTarget);
+                    slide.removeAttribute("aria-hidden");
+                    slide.style.setProperty("display", isTarget ? "block" : "none", "important");
+                    slide.style.setProperty("position", "fixed", "important");
+                    slide.style.setProperty("inset", "0 auto auto 0", "important");
+                    slide.style.setProperty("width", `${width}px`, "important");
+                    slide.style.setProperty("height", `${height}px`, "important");
+                    slide.style.setProperty("min-width", `${width}px`, "important");
+                    slide.style.setProperty("min-height", `${height}px`, "important");
+                    slide.style.setProperty("max-width", `${width}px`, "important");
+                    slide.style.setProperty("max-height", `${height}px`, "important");
+                    slide.style.setProperty("margin", "0", "important");
+                    slide.style.setProperty("opacity", "1", "important");
+                    slide.style.setProperty("transform", "none", "important");
+                    slide.style.setProperty("overflow", "hidden", "important");
+                    slide.querySelectorAll(".step,.fragment,[data-animate],[data-animation]").forEach((node) => {
+                        node.classList.add("visible");
+                        node.style.setProperty("opacity", "1", "important");
+                        node.style.setProperty("visibility", "visible", "important");
+                        node.style.setProperty("transform", "none", "important");
+                    });
+                });
+                target = slides[targetIndex];
+            } else if (targetIndex > 0) {
+                return { ok: false, slideCount: 1 };
+            }
+            document.querySelectorAll("[data-html-slide-editor],.html-slide-editor-box,.html-slide-editor-guide-layer,.html-slide-editor-guide,#progress-bar").forEach((node) => node.remove());
+            await wait(250);
+            await Promise.race([
+                Promise.all(Array.from(document.images).filter((image) => !image.complete).map((image) => new Promise((resolve) => {
+                    image.addEventListener("load", resolve, { once: true });
+                    image.addEventListener("error", resolve, { once: true });
+                }))),
+                wait(2500),
+            ]);
+            const rect = target.getBoundingClientRect();
+            return { ok: true, slideCount: slides.length || 1, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+        }
+    """
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            page = await browser.new_page(
+                viewport={"width": LECTURE_HTML_RENDER_WIDTH, "height": LECTURE_HTML_RENDER_HEIGHT},
+                device_scale_factor=1,
+            )
+            try:
+                await page.goto(html_path.resolve().as_uri(), wait_until="networkidle")
+                for ref in refs:
+                    _, slide_index = split_html_slide_reference(ref)
+                    target_index = 0 if slide_index is None else slide_index - 1
+                    result = await page.evaluate(
+                        render_script,
+                        {
+                            "targetIndex": target_index,
+                            "width": LECTURE_HTML_RENDER_WIDTH,
+                            "height": LECTURE_HTML_RENDER_HEIGHT,
+                        },
+                    )
+                    if not result.get("ok"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"HTML slide reference '{ref}' is out of range. Found {result.get('slideCount', 0)} slides in {html_filename}.",
+                        )
+                    output_path = output_dir / rendered_document_slide_output_name(html_filename, slide_index)
+                    await page.screenshot(path=str(output_path), full_page=False)
+                    rendered[ref] = str(output_path)
+            finally:
+                await page.close()
+                await browser.close()
+    except HTTPException:
+        raise
+    except PlaywrightError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "HTML slide rendering failed. "
+                "If Chromium is not installed, run 'python -m playwright install chromium'. "
+                f"Original error: {exc}"
+            ),
+        ) from exc
+    return rendered
+
+
+def render_pdf_slide_refs(pdf_path: Path, requested_refs: List[str], output_dir: Path) -> Dict[str, str]:
+    try:
+        import fitz
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF slide rendering requires PyMuPDF. Install it with 'pip install pymupdf'.",
+        ) from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf_filename = pdf_path.name
+    refs = list(dict.fromkeys(requested_refs))
+    rendered: Dict[str, str] = {}
+    try:
+        with fitz.open(pdf_path) as document:
+            page_count = int(document.page_count or 0)
+            if page_count < 1:
+                raise HTTPException(status_code=400, detail=f"PDF slide file has no pages: {pdf_filename}")
+            for ref in refs:
+                _, slide_index = split_html_slide_reference(ref)
+                page_number = 1 if slide_index is None else slide_index
+                if page_number < 1 or page_number > page_count:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"PDF slide reference '{ref}' is out of range. Found {page_count} pages in {pdf_filename}.",
+                    )
+                page = document.load_page(page_number - 1)
+                rect = page.rect
+                if rect.width <= 0 or rect.height <= 0:
+                    raise HTTPException(status_code=400, detail=f"PDF page has invalid size: {ref}")
+                scale = min(LECTURE_HTML_RENDER_WIDTH / rect.width, LECTURE_HTML_RENDER_HEIGHT / rect.height)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                output_path = output_dir / rendered_document_slide_output_name(pdf_filename, slide_index)
+                pixmap.save(output_path)
+                rendered[ref] = str(output_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF slide rendering failed: {exc}") from exc
+    return rendered
+
+
+def extract_json_object(text: str) -> Dict:
+    raw = (text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
+def clamp_ai_video_scene_count(value: Optional[int] = None) -> int:
+    default_count = max(1, min(AI_VIDEO_DEFAULT_SCENE_COUNT, AI_VIDEO_MAX_SCENE_COUNT))
+    try:
+        count = int(value or default_count)
+    except (TypeError, ValueError):
+        count = default_count
+    return max(1, min(count, AI_VIDEO_MAX_SCENE_COUNT))
+
+
+def default_ai_video_character_assets() -> List[Dict]:
+    assets: List[Dict] = []
+    for asset in DEFAULT_AI_CHARACTER_ASSETS:
+        path = AI_CHARACTER_ASSET_DIR / asset["filename"]
+        if path.exists() and path.is_file():
+            assets.append({
+                **asset,
+                "path": str(path),
+                "default": True,
+            })
+    if assets:
+        return assets
+    path = DEFAULT_AI_CHARACTER_ASSET_PATH.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists() or not path.is_file():
+        return []
+    return [{
+        "name": DEFAULT_AI_CHARACTER_NAME or path.stem,
+        "filename": path.name,
+        "path": str(path),
+        "description": DEFAULT_AI_CHARACTER_DESCRIPTION,
+        "default": True,
+    }]
+
+
+def merge_ai_video_character_assets(*asset_groups: Optional[List[Dict]]) -> List[Dict]:
+    merged: List[Dict] = []
+    seen = set()
+    for assets in asset_groups:
+        for asset in assets or []:
+            name = str(asset.get("name") or Path(str(asset.get("filename") or asset.get("path") or "")).stem).strip()
+            path = str(asset.get("path") or "").strip()
+            if not name or not path:
+                continue
+            key = (name.lower(), str(Path(path).expanduser()).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({
+                **asset,
+                "name": name,
+                "filename": str(asset.get("filename") or Path(path).name),
+                "path": path,
+            })
+    return merged
+
+
+def ai_video_character_names(extra_names: Optional[List[str]] = None, character_assets: Optional[List[Dict]] = None) -> List[str]:
+    names: List[str] = []
+    for name in extra_names or []:
+        clean_name = str(name).strip()
+        if clean_name and clean_name.lower() not in {item.lower() for item in names}:
+            names.append(clean_name)
+    for asset in character_assets or []:
+        clean_name = str(asset.get("name") or "").strip()
+        if clean_name and clean_name.lower() not in {item.lower() for item in names}:
+            names.append(clean_name)
+    return names
+
+
+CHARACTER_APPEARANCE_PATTERNS = [
+    r"\b(?:a|an|the)\s+curious\s+white\s+bear\s+mascot\s+with\s+a\s+blue\s+AI\s+headband\b",
+    r"\b(?:a|an|the)\s+white\s+bear\s+mascot\s+with\s+a\s+blue\s+AI\s+headband\b",
+    r"\b(?:a|an|the)\s+yellow\s+chick\s+mascot\s+with\s+a\s+blue\s+AI\s+headband\b",
+    r"\bwhite\s+bear\s+mascot\b",
+    r"\byellow\s+chick\s+mascot\b",
+    r"\bblue\s+AI\s+headband\b",
+    r"\bAI\s+headband\b",
+    r"\bOr\b",
+    r"\bPpiya\b",
+    r"오르",
+    r"삐야",
+]
+
+
+def strip_character_appearance_from_prompt(prompt: str, character_usage: List[str]) -> str:
+    cleaned = str(prompt or "").strip()
+    if not cleaned or not character_usage:
+        return cleaned
+    for pattern in CHARACTER_APPEARANCE_PATTERNS:
+        cleaned = re.sub(pattern, "the referenced character", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\bthe referenced character\s+with\s+the referenced character\b", "the referenced character", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" ,.")
+
+
+def normalize_ai_video_scene(scene: Dict, index: int) -> Dict:
+    script = re.sub(r"\s+", " ", str(scene.get("script") or "").strip())
+    image_prompt = re.sub(r"\s+", " ", str(scene.get("image_prompt") or "").strip())
+    visual_notes = re.sub(r"\s+", " ", str(scene.get("visual_notes") or "").strip())
+    scene_kind = str(scene.get("scene_kind") or "veo_clip").strip().lower()
+    if scene_kind not in {"veo_clip", "image_narration"}:
+        scene_kind = "veo_clip"
+    audio_mode = str(scene.get("audio_mode") or "narrator").strip().lower()
+    if audio_mode not in {"narrator", "silent", "veo_audio"}:
+        audio_mode = "narrator"
+    video_prompt = re.sub(r"\s+", " ", str(scene.get("video_prompt") or "").strip())
+    dialogue = re.sub(r"\s+", " ", str(scene.get("dialogue") or "").strip())
+    sound_design = re.sub(r"\s+", " ", str(scene.get("sound_design") or "").strip())
+    subtitle_text = re.sub(r"\s+", " ", str(scene.get("subtitle_text") or "").strip())
+    raw_character_usage = scene.get("character_usage") or []
+    if isinstance(raw_character_usage, str):
+        raw_character_usage = [part.strip() for part in raw_character_usage.split(",")]
+    character_usage = [str(name).strip() for name in raw_character_usage if str(name).strip()]
+    video_prompt = strip_character_appearance_from_prompt(video_prompt, character_usage)
+    character_role = re.sub(r"\s+", " ", str(scene.get("character_role") or "").strip())
+    try:
+        duration_seconds = float(scene.get("duration_seconds") or VEO_DEFAULT_DURATION_SECONDS)
+    except (TypeError, ValueError):
+        duration_seconds = VEO_DEFAULT_DURATION_SECONDS
+    duration_seconds = min(max(duration_seconds, 2.0), VEO_MAX_DURATION_SECONDS)
+    if not script and audio_mode == "veo_audio" and dialogue:
+        script = dialogue
+    if not script:
+        script = f"Scene {index}."
+    if not image_prompt:
+        image_prompt = f"Create a clean 16:9 visual illustration for this narration: {script[:240]}"
+    if not video_prompt:
+        video_prompt = (
+            f"Vertical 9:16 short-form video scene. {visual_notes or image_prompt}. "
+            f"Action: {script[:220]}. "
+            "Fast pacing, cinematic movement, social short-form style."
+        )
+    if subtitle_text != script:
+        subtitle_text = script
+    return {
+        "scene_no": int(scene.get("scene_no") or index),
+        "script": script,
+        "image_prompt": image_prompt,
+        "visual_notes": visual_notes,
+        "scene_kind": scene_kind,
+        "audio_mode": audio_mode,
+        "video_prompt": video_prompt,
+        "dialogue": dialogue,
+        "sound_design": sound_design,
+        "subtitle_text": subtitle_text,
+        "duration_seconds": duration_seconds,
+        "character_usage": character_usage,
+        "character_role": character_role,
+    }
+
+
+def normalize_ai_video_draft(data: Dict, request: AiVideoDraftRequest, research_mode: str) -> Dict:
+    scenes = data.get("scenes") if isinstance(data, dict) else []
+    if not isinstance(scenes, list):
+        scenes = []
+    scene_count = clamp_ai_video_scene_count(max(len(scenes), AI_VIDEO_DEFAULT_SCENE_COUNT))
+    normalized = [normalize_ai_video_scene(scene if isinstance(scene, dict) else {}, index + 1) for index, scene in enumerate(scenes[:scene_count])]
+    while len(normalized) < scene_count:
+        index = len(normalized) + 1
+        normalized.append(normalize_ai_video_scene({
+            "scene_no": index,
+            "script": f"{request.topic}에 대한 핵심 내용을 장면 {index}에서 설명합니다.",
+            "image_prompt": f"16:9 clean modern illustration about {request.topic}, scene {index}",
+        }, index))
+    target_aspect_ratio, aspect_warning = resolve_ai_video_aspect_ratio(request.image_style, "veo", request.aspect_ratio)
+    character_assets = default_ai_video_character_assets()
+    return {
+        "draft_id": str(uuid.uuid4()),
+        "title": str(data.get("title") or request.topic).strip()[:120],
+        "summary": str(data.get("summary") or "").strip(),
+        "topic": request.topic.strip(),
+        "language": (request.language or "ko").lower(),
+        "target_duration": request.target_duration,
+        "audience": request.audience,
+        "tone": request.tone,
+        "image_style": request.image_style,
+        "aspect_ratio": target_aspect_ratio,
+        "aspect_ratio_warning": aspect_warning or "",
+        "character_assets": character_assets,
+        "research_mode": research_mode,
+        "scenes": normalized,
+    }
+
+
+def build_ai_video_draft_prompt(request: AiVideoDraftRequest, research_mode: str) -> str:
+    scene_count = clamp_ai_video_scene_count()
+    target_aspect_ratio, aspect_warning = resolve_ai_video_aspect_ratio(request.image_style, "veo", request.aspect_ratio)
+    default_character_assets = default_ai_video_character_assets()
+    character_names = ai_video_character_names(request.character_names, default_character_assets)
+    character_text = ", ".join(character_names) if character_names else "No predefined characters."
+    return f"""
+Return only valid JSON. Do not use markdown fences.
+Create or adapt a short-form vertical video production plan.
+
+User topic or planning brief:
+{request.topic}
+Language: {request.language}
+Target duration: {request.target_duration}
+Audience: {request.audience}
+Narration tone: {request.tone}
+Image style: {request.image_style}
+Target aspect ratio: {target_aspect_ratio}
+Aspect ratio note: {aspect_warning or "Use the target aspect ratio consistently."}
+Available predefined characters: {character_text}
+Research mode: {research_mode}
+
+Rules:
+- Create exactly {scene_count} scenes for a Shorts/Reels/TikTok style video.
+- If the user input is already a shorts plan, storyboard, script, scene list, or prompt list, do not reinvent the concept. Adapt that plan into the JSON scenes.
+- If the user input includes scene numbers, scene titles, dialogue, narration, or visual prompts, preserve their order and intent.
+- If a visual/video prompt is provided by the user, use it as the scene video_prompt after removing any character appearance descriptions that should come from reference images.
+- If the user input is only a broad topic, then plan the scenes yourself.
+- Write video_prompt for the target aspect ratio: {target_aspect_ratio}.
+- Plan fast visual pacing. Most scenes should feel like 2-4 second beats.
+- Keep each narrator script very short: one sentence only, ideally 6-12 Korean words or 6-10 English words.
+- If a thought needs more words, split it into multiple scenes instead of writing a long script.
+- Prefer more quick visual beats over fewer explanatory scenes.
+- Decide each scene_kind:
+  - "veo_clip": moving video generated by Veo. The prompt must describe only the visual scene, action, camera movement, and mood.
+  - "image_narration": static/generated image plus external narrator TTS, only when explanation is needed or Veo is unnecessary.
+- Decide each audio_mode:
+  - "narrator": external TTS narration explains the scene.
+  - "veo_audio": Veo generates the scene's direct dialogue, sound effects, ambience, or music. Do not use external TTS for this scene.
+  - "silent": no speech, visual beat only.
+- Use "veo_audio" when the scene should contain direct in-video dialogue, reactions, sound effects, ambience, or native video audio.
+- Use "narrator" when the scene needs external explanatory narration.
+- For "narrator" scenes, do not ask Veo to create speech, music, sound effects, ambience, or character dialogue.
+- For "veo_audio" scenes, put direct spoken lines in dialogue and audio cues in sound_design. Keep script as a short subtitle/meaning summary for the same spoken content.
+- For veo_clip narrator scenes, video_prompt is visual-only. script is the exact separate narrator line that will be generated by TTS and used as the subtitle.
+- For veo_clip veo_audio scenes, video_prompt describes the visual action and dialogue/sound_design describe the native audio.
+- Narration should be punchy and short-form, not lecture-style.
+- subtitle_text must match script exactly. Do not write scene titles, labels, summaries, or hook captions in subtitle_text.
+- Avoid text-heavy visuals.
+- If predefined characters are useful, set character_usage to one or more character names from the available list.
+- Do not force characters into every scene. Use [] when the scene is better without them.
+- If a character is used, write only the role/action in character_role, such as "holds an almond and looks curious".
+- Do not describe predefined character appearance, species, color, clothing, headband, face, body shape, or mascot design in video_prompt.
+- Do not write phrases like "white bear mascot", "yellow chick mascot", "blue AI headband", or any other reference-image appearance details in video_prompt.
+- The video_prompt must describe only the scene content, action, camera movement, setting, lighting, and mood.
+- The character's visual identity will be supplied as an attached reference image, not as text.
+
+JSON shape:
+{{
+  "title": "video title",
+  "summary": "one sentence summary",
+  "scenes": [
+    {{
+      "scene_no": 1,
+      "scene_kind": "veo_clip",
+      "audio_mode": "narrator",
+      "duration_seconds": 5,
+      "script": "external narrator text for this scene",
+      "video_prompt": "vertical 9:16 visual-only video prompt with action and camera movement; no audio instructions",
+      "dialogue": "direct in-video dialogue only when audio_mode is veo_audio",
+      "sound_design": "sound effects, ambience, or music only when audio_mode is veo_audio",
+      "subtitle_text": "short subtitle text to show for this scene",
+      "visual_notes": "brief note",
+      "character_usage": ["character name"],
+      "character_role": "how the character appears or acts in this scene"
+    }}
+  ]
+}}
+"""
+
+
+def generate_ai_video_draft(request: AiVideoDraftRequest) -> Dict:
+    if not request.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic is required.")
+    if not gemini_text_client:
+        raise HTTPException(status_code=500, detail="Gemini text client is not configured.")
+    research_mode = "llm_only"
+    prompt = build_ai_video_draft_prompt(request, research_mode)
+    try:
+        data = extract_json_object(generate_gemini_text(prompt, operation="ai_video_draft"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AI video draft JSON parsing failed: {exc}") from exc
+    draft = normalize_ai_video_draft(data, request, research_mode)
+    AI_VIDEO_DRAFTS[draft["draft_id"]] = draft
+    return draft
+
+
+def ai_video_script_text(scenes: List[Dict]) -> str:
+    lines = []
+    for scene in scenes:
+        detail = scene.get("dialogue") or scene.get("script") or scene.get("subtitle_text") or ""
+        lines.append(f"{scene['scene_no']}. [{scene.get('scene_kind', 'scene')}/{scene.get('audio_mode', '')}] {detail}")
+    return "\n".join(lines)
+
+
+def ai_video_timeline_items(scenes: List[Dict]) -> List[Dict]:
+    return [
+        {
+            "slide_no": scene["scene_no"],
+            "slide_file": f"scene_{scene['scene_no']:03d}.png",
+            "script": scene["script"],
+            "image_prompt": scene.get("image_prompt", ""),
+            "visual_notes": scene.get("visual_notes", ""),
+            "scene_kind": scene.get("scene_kind", "image_narration"),
+            "audio_mode": scene.get("audio_mode", "narrator"),
+            "video_prompt": scene.get("video_prompt", ""),
+            "dialogue": scene.get("dialogue", ""),
+            "sound_design": scene.get("sound_design", ""),
+            "subtitle_text": scene.get("subtitle_text", scene.get("script", "")),
+            "duration_seconds": scene.get("duration_seconds", VEO_DEFAULT_DURATION_SECONDS),
+            "character_usage": scene.get("character_usage", []),
+            "character_role": scene.get("character_role", ""),
+        }
+        for scene in scenes
+    ]
+
+
+def create_fallback_scene_image(scene: Dict, output_path: Path) -> None:
+    title = f"Scene {scene.get('scene_no', 1)}"
+    script = re.sub(r"\s+", " ", str(scene.get("script") or "").strip())[:220]
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+html,body{{margin:0;width:1920px;height:1080px;background:#111827;color:white;font-family:Arial,'Malgun Gothic',sans-serif;}}
+.frame{{width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;padding:120px;box-sizing:border-box;background:linear-gradient(135deg,#111827,#1f2937 55%,#334155);}}
+.kicker{{font-size:34px;color:#93c5fd;text-transform:uppercase;letter-spacing:4px;margin-bottom:28px;}}
+h1{{font-size:88px;line-height:1.05;margin:0 0 40px;max-width:1400px;}}
+p{{font-size:44px;line-height:1.35;margin:0;max-width:1500px;color:#e5e7eb;}}
+</style></head><body><div class="frame"><div class="kicker">AI Video</div><h1>{title}</h1><p>{script}</p></div></body></html>"""
+    temp_html = output_path.with_suffix(".html")
+    temp_html.write_text(html, encoding="utf-8")
+    try:
+        rendered = asyncio.run(render_html_slide_refs(temp_html, [temp_html.name], output_path.parent))
+        rendered_path = Path(next(iter(rendered.values())))
+        if rendered_path != output_path:
+            rendered_path.replace(output_path)
+    finally:
+        try:
+            temp_html.unlink()
+        except OSError:
+            pass
+
+
+def save_imagen_response_image(response: Any, output_path: Path) -> bool:
+    generated_images = getattr(response, "generated_images", None) or getattr(response, "images", None) or []
+    for image_item in generated_images:
+        image = getattr(image_item, "image", image_item)
+        data = getattr(image, "image_bytes", None) or getattr(image, "data", None)
+        if data:
+            output_path.write_bytes(data)
+            return True
+    return False
+
+
+def save_gemini_generated_image(response: Any, output_path: Path) -> bool:
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            inline_bytes = getattr(inline_data, "data", None) if inline_data else None
+            if inline_bytes:
+                if isinstance(inline_bytes, str):
+                    output_path.write_bytes(base64.b64decode(inline_bytes))
+                else:
+                    output_path.write_bytes(bytes(inline_bytes))
+                return True
+    return False
+
+
+def ai_video_visual_prompt(scene: Dict) -> str:
+    prompt = scene.get("image_prompt") or scene.get("script") or "clean editorial image"
+    aspect_ratio = scene.get("aspect_ratio") or AI_VIDEO_IMAGE_ASPECT_RATIO
+    return (
+        f"{prompt}\n\n"
+        f"Create one polished {aspect_ratio} video frame for a short-form educational video. "
+        "Do not place captions, subtitles, UI labels, watermarks, or long readable text inside the image. "
+        "Make it visually complete and suitable as a scene background."
+    )
+
+
+def normalize_ai_video_visual_provider(provider: Optional[str]) -> str:
+    normalized = (provider or AI_VIDEO_VISUAL_PROVIDER or "nano_banana").strip().lower().replace("-", "_")
+    aliases = {
+        "gemini": "nano_banana",
+        "gemini_image": "nano_banana",
+        "nanobanana": "nano_banana",
+        "nano_banana_image": "nano_banana",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def generate_nano_banana_scene_image(scene: Dict, output_path: Path) -> Dict:
+    image_client = create_gemini_image_client()
+    prompt = ai_video_visual_prompt(scene)
+    aspect_ratio = scene.get("aspect_ratio") if scene.get("aspect_ratio") in IMAGE_SUPPORTED_ASPECT_RATIOS else AI_VIDEO_IMAGE_ASPECT_RATIO
+    errors: List[str] = []
+    for model_name in NANO_BANANA_MODELS:
+        try:
+            config = None
+            if google_genai_types:
+                config = google_genai_types.GenerateContentConfig(
+                    response_modalities=[
+                        google_genai_types.Modality.TEXT,
+                        google_genai_types.Modality.IMAGE,
+                    ],
+                    image_config=google_genai_types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                    ),
+                )
+            response = image_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+            if not save_gemini_generated_image(response, output_path):
+                raise RuntimeError("Nano Banana response did not contain image bytes.")
+            ai_usage.record_ai_usage(
+                provider="nano_banana",
+                model=model_name,
+                operation="image_generation",
+                characters=len(prompt),
+                request_count=1,
+                estimated_cost_usd=0.0,
+                metadata={
+                    "usage_source": "request_count_estimate",
+                    "aspect_ratio": aspect_ratio,
+                    "location": AI_VIDEO_IMAGE_LOCATION,
+                    "api_version": AI_VIDEO_IMAGE_API_VERSION,
+                },
+            )
+            return {
+                "provider": "nano_banana",
+                "model": model_name,
+                "fallback": False,
+                "aspect_ratio": aspect_ratio,
+                "location": AI_VIDEO_IMAGE_LOCATION,
+                "api_version": AI_VIDEO_IMAGE_API_VERSION,
+                "attempted_models": NANO_BANANA_MODELS,
+            }
+        except Exception as exc:
+            errors.append(f"{model_name}: {exc}")
+            continue
+    raise RuntimeError("Nano Banana image generation failed for all configured models. " + " | ".join(errors))
+
+
+def generate_imagen_scene_image(scene: Dict, output_path: Path) -> Dict:
+    prompt = ai_video_visual_prompt(scene)
+    if not gemini_tts_client:
+        raise RuntimeError("Gemini client is not configured.")
+    config = None
+    if google_genai_types and hasattr(google_genai_types, "GenerateImagesConfig"):
+        try:
+            config = google_genai_types.GenerateImagesConfig(
+                numberOfImages=1,
+                aspectRatio=AI_VIDEO_IMAGE_ASPECT_RATIO,
+            )
+        except TypeError:
+            config = google_genai_types.GenerateImagesConfig(numberOfImages=1)
+    response = gemini_tts_client.models.generate_images(
+        model=IMAGEN_MODEL,
+        prompt=prompt,
+        config=config,
+    )
+    if not save_imagen_response_image(response, output_path):
+        raise RuntimeError("Imagen response did not contain image bytes.")
+    ai_usage.record_ai_usage(
+        provider="imagen",
+        model=IMAGEN_MODEL,
+        operation="image_generation",
+        characters=len(prompt),
+        request_count=1,
+        estimated_cost_usd=0.0,
+        metadata={"usage_source": "request_count_estimate", "aspect_ratio": AI_VIDEO_IMAGE_ASPECT_RATIO},
+    )
+    return {"provider": "imagen", "model": IMAGEN_MODEL, "fallback": False}
+
+
+def generate_scene_image_by_provider(scene: Dict, output_path: Path, provider: str) -> Dict:
+    if provider == "nano_banana":
+        return generate_nano_banana_scene_image(scene, output_path)
+    if provider == "imagen":
+        return generate_imagen_scene_image(scene, output_path)
+    raise RuntimeError(f"Unsupported AI video visual provider: {provider}")
+
+
+def normalize_ai_video_visual_mode(mode: Optional[str]) -> str:
+    normalized = (mode or AI_VIDEO_VISUAL_MODE or "veo").strip().lower().replace("-", "_")
+    if normalized in {"shorts", "veo", "veo_clip", "video"}:
+        return "veo"
+    return "image"
+
+
+def build_veo_scene_prompt(scene: Dict) -> str:
+    prompt = scene.get("video_prompt") or scene.get("visual_notes") or scene.get("image_prompt") or scene.get("script") or ""
+    aspect_ratio = scene.get("aspect_ratio") if scene.get("aspect_ratio") in VEO_SUPPORTED_ASPECT_RATIOS else VEO_ASPECT_RATIO
+    character_role = scene.get("character_role") or ""
+    audio_mode = scene.get("audio_mode") or "narrator"
+    dialogue = scene.get("dialogue") or ""
+    sound_design = scene.get("sound_design") or ""
+    parts = [
+        f"{aspect_ratio} short-form video clip.",
+        "Fast pacing, strong hook, cinematic camera movement, clear subject action.",
+        prompt,
+        (
+            "Use the attached reference image as the character identity source. "
+            "Do not infer or redesign the character from text. "
+            "Do not show the reference sheet, lineup, grid, turntable, or multiple pose sheet in the final video. "
+            f"Character action or role in this scene: {character_role}"
+        ) if scene.get("character_reference_path") else "",
+        "No burned-in captions, subtitles, logos, watermarks, or readable UI text.",
+    ]
+    if audio_mode == "veo_audio":
+        parts.extend([
+            "Generate native video audio for this scene.",
+            f"Direct spoken dialogue: {dialogue}" if dialogue else "",
+            f"Sound design: {sound_design}" if sound_design else "",
+            "Keep dialogue short, natural, and synchronized to the visible action.",
+        ])
+    else:
+        parts.extend([
+            "Create visual footage only. No speech, no dialogue, no voiceover, no music, no sound effects, no ambience.",
+            "Do not include any character speaking to camera or lip-syncing.",
+        ])
+    return "\n".join(part for part in parts if str(part).strip())
+
+
+def attach_character_assets_to_scenes(scenes: List[Dict], character_assets: List[Dict]) -> None:
+    lookup = {
+        str(asset.get("name") or "").strip().lower(): asset
+        for asset in character_assets or []
+        if asset.get("name") and asset.get("path")
+    }
+    for scene in scenes:
+        scene_assets = []
+        for character_name in scene.get("character_usage") or []:
+            asset = lookup.get(str(character_name).strip().lower())
+            if asset:
+                scene_assets.append(asset)
+        if scene_assets:
+            scene["character_reference_assets"] = scene_assets
+            first_asset = scene_assets[0]
+            scene["character_reference_path"] = first_asset.get("path")
+            scene["character_reference_name"] = ", ".join(str(asset.get("name") or "") for asset in scene_assets if asset.get("name"))
+            scene["character_reference_description"] = first_asset.get("description") or ""
+
+
+def veo_reference_images_for_scene(scene: Dict) -> List[Any]:
+    if not google_genai_types:
+        return []
+    raw_assets = scene.get("character_reference_assets") or []
+    if not raw_assets and scene.get("character_reference_path"):
+        raw_assets = [{
+            "path": scene.get("character_reference_path"),
+            "name": scene.get("character_reference_name") or "",
+        }]
+    reference_images = []
+    for asset in raw_assets:
+        raw_path = str(asset.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        image = google_genai_types.Image(image_bytes=path.read_bytes(), mime_type=mime_type)
+        reference_type = getattr(google_genai_types.VideoGenerationReferenceType, "ASSET", "ASSET")
+        reference_images.append(
+            google_genai_types.VideoGenerationReferenceImage(
+                image=image,
+                reference_type=reference_type,
+            )
+        )
+    return reference_images
+
+
+def veo_reference_image_for_scene(scene: Dict) -> Optional[Any]:
+    reference_images = veo_reference_images_for_scene(scene)
+    if reference_images:
+        return getattr(reference_images[0], "image", None)
+    return None
+
+
+def save_veo_generated_video(client: Any, generated_video: Any, output_path: Path) -> bool:
+    video = getattr(generated_video, "video", generated_video)
+    video_bytes = getattr(video, "video_bytes", None)
+    if video_bytes:
+        output_path.write_bytes(video_bytes if isinstance(video_bytes, bytes) else bytes(video_bytes))
+        return True
+    try:
+        if hasattr(video, "save"):
+            video.save(str(output_path))
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return True
+    except Exception:
+        pass
+    try:
+        downloaded = client.files.download(file=video)
+        if downloaded:
+            output_path.write_bytes(downloaded if isinstance(downloaded, bytes) else bytes(downloaded))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def generate_veo_scene_video(scene: Dict, output_path: Path) -> Dict:
+    client = create_veo_client()
+    prompt = build_veo_scene_prompt(scene)
+    aspect_ratio = scene.get("aspect_ratio") if scene.get("aspect_ratio") in VEO_SUPPORTED_ASPECT_RATIOS else VEO_ASPECT_RATIO
+    generate_audio = (scene.get("audio_mode") or "") == "veo_audio"
+    reference_images = veo_reference_images_for_scene(scene)
+    errors: List[str] = []
+    requested_resolutions = []
+    for resolution in [VEO_RESOLUTION, "720p", ""]:
+        normalized_resolution = str(resolution or "").strip()
+        if normalized_resolution not in requested_resolutions:
+            requested_resolutions.append(normalized_resolution)
+    for model_name in VEO_MODELS:
+        for requested_resolution in requested_resolutions:
+            try:
+                config = None
+                if google_genai_types:
+                    config_kwargs = {
+                        "number_of_videos": 1,
+                        "aspect_ratio": aspect_ratio,
+                        "generate_audio": generate_audio,
+                        "enhance_prompt": False if reference_images else True,
+                    }
+                    if requested_resolution:
+                        config_kwargs["resolution"] = requested_resolution
+                    if reference_images:
+                        config_kwargs["reference_images"] = reference_images
+                    config = google_genai_types.GenerateVideosConfig(**config_kwargs)
+                operation = client.models.generate_videos(
+                    model=model_name,
+                    prompt=prompt,
+                    config=config,
+                )
+                waited = 0.0
+                while not getattr(operation, "done", False):
+                    if waited >= VEO_MAX_WAIT_SECONDS:
+                        raise RuntimeError(f"Veo operation timed out after {VEO_MAX_WAIT_SECONDS:.0f}s.")
+                    time.sleep(VEO_POLL_INTERVAL_SECONDS)
+                    waited += VEO_POLL_INTERVAL_SECONDS
+                    operation = client.operations.get(operation)
+                operation_error = getattr(operation, "error", None)
+                if operation_error:
+                    raise RuntimeError(f"Veo operation failed: {operation_error}")
+                response = getattr(operation, "response", None) or getattr(operation, "result", None)
+                generated_videos = getattr(response, "generated_videos", None) or []
+                if not generated_videos:
+                    response_dump = ""
+                    try:
+                        if hasattr(response, "model_dump_json"):
+                            response_dump = response.model_dump_json()[:1200]
+                        else:
+                            response_dump = str(response)[:1200]
+                    except Exception:
+                        response_dump = str(response)[:1200]
+                    raise RuntimeError(f"Veo response did not include generated videos. response={response_dump}")
+                if not save_veo_generated_video(client, generated_videos[0], output_path):
+                    raise RuntimeError("Veo generated video could not be downloaded.")
+                generated_duration = video_utils.media_duration_seconds(output_path)
+                resolution_label = requested_resolution or "provider_default"
+                ai_usage.record_ai_usage(
+                    provider="veo",
+                    model=model_name,
+                    operation="video_generation",
+                    characters=len(prompt),
+                    request_count=1,
+                    estimated_cost_usd=0.0,
+                    metadata={
+                        "duration_seconds": generated_duration,
+                        "aspect_ratio": aspect_ratio,
+                        "resolution": resolution_label,
+                        "generate_audio": generate_audio,
+                        "character_reference": scene.get("character_reference_name") or "",
+                        "reference_image_count": len(reference_images),
+                        "location": VEO_LOCATION,
+                        "api_version": VEO_API_VERSION,
+                    },
+                )
+                return {
+                    "provider": "veo",
+                    "model": model_name,
+                    "duration_seconds": generated_duration,
+                    "aspect_ratio": aspect_ratio,
+                    "resolution": resolution_label,
+                    "generate_audio": generate_audio,
+                    "character_reference": scene.get("character_reference_name") or "",
+                    "reference_image_count": len(reference_images),
+                    "location": VEO_LOCATION,
+                    "api_version": VEO_API_VERSION,
+                    "prompt": prompt,
+                    "attempted_models": VEO_MODELS,
+                }
+            except Exception as exc:
+                suffix = f" ({requested_resolution})" if requested_resolution else " (provider_default_resolution)"
+                errors.append(f"{model_name}{suffix}: {exc}")
+                continue
+    raise RuntimeError("Veo video generation failed for all configured models. " + " | ".join(errors))
+
+
+async def generate_ai_video_scene_images(
+    scenes: List[Dict],
+    project_dir: Path,
+    visual_provider: Optional[str] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Tuple[Dict[str, str], List[Dict]]:
+    image_dir = project_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    slide_manifest: Dict[str, str] = {}
+    image_metadata: List[Dict] = []
+    provider = normalize_ai_video_visual_provider(visual_provider)
+    for index, scene in enumerate(scenes, 1):
+        filename = f"scene_{int(scene['scene_no']):03d}.png"
+        output_path = image_dir / filename
+        if progress_callback:
+            await report_progress(progress_callback, 18 + int((index - 1) / max(len(scenes), 1) * 30), f"Generating scene image {index}/{len(scenes)}")
+        metadata = {"scene_no": scene["scene_no"], "filename": filename, "prompt": scene.get("image_prompt", ""), "requested_provider": provider}
+        try:
+            generation_metadata = await asyncio.to_thread(generate_scene_image_by_provider, scene, output_path, provider)
+            metadata.update(generation_metadata)
+        except Exception as exc:
+            print(f"{provider} image generation failed for scene {scene.get('scene_no')}: {exc}")
+            if not AI_VIDEO_ALLOW_TEXT_FALLBACK:
+                raise RuntimeError(f"Scene {scene.get('scene_no')} image generation failed with {provider}: {exc}") from exc
+            await asyncio.to_thread(create_fallback_scene_image, scene, output_path)
+            metadata.update({"provider": "fallback", "fallback": True, "error": str(exc)})
+        slide_manifest[filename] = str(output_path)
+        image_metadata.append(metadata)
+    return slide_manifest, image_metadata
+
+
+async def create_static_narration_scene_clip(
+    scene: Dict,
+    output_path: Path,
+    project_dir: Path,
+    language: str,
+    voice_name: Optional[str],
+    style_prompt: Optional[str],
+    tts_provider: Optional[str],
+    visual_provider: Optional[str],
+) -> Dict:
+    image_path = project_dir / "images" / f"scene_{int(scene['scene_no']):03d}.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_meta = await asyncio.to_thread(
+        generate_scene_image_by_provider,
+        scene,
+        image_path,
+        normalize_ai_video_visual_provider(visual_provider),
+    )
+    audio_mode = scene.get("audio_mode") or "narrator"
+    narration_text = scene.get("script") or scene.get("subtitle_text") or ""
+    temp_paths: List[Path] = []
+    target_width, target_height = (720, 1280) if scene.get("aspect_ratio") == "9:16" else (1280, 720)
+    try:
+        if audio_mode == "narrator" and narration_text.strip():
+            audio_path = OUTPUT_DIR / f"ai_scene_tts_{uuid.uuid4().hex}.mp3"
+            temp_paths.append(audio_path)
+            audio_meta = await synthesize_audio_from_text(
+                narration_text,
+                language,
+                audio_path,
+                voice_name=voice_name,
+                style_prompt=style_prompt,
+                tts_provider=tts_provider,
+            )
+            duration_seconds = max(float(audio_meta.get("duration_ms") or 0) / 1000.0 + 0.35, 2.0)
+            segment_path = OUTPUT_DIR / f"ai_scene_static_{uuid.uuid4().hex}.mp4"
+            temp_paths.append(segment_path)
+            await asyncio.to_thread(
+                video_utils.create_slide_segment,
+                image_path,
+                duration_seconds,
+                segment_path,
+                0,
+                target_width,
+                target_height,
+            )
+            await asyncio.to_thread(mux_video_with_audio, segment_path, audio_path, output_path)
+            scene_duration = video_utils.media_duration_seconds(output_path)
+        else:
+            scene_duration = min(max(float(scene.get("duration_seconds") or VEO_DEFAULT_DURATION_SECONDS), 2.0), VEO_MAX_DURATION_SECONDS)
+            await asyncio.to_thread(
+                video_utils.create_slide_segment,
+                image_path,
+                scene_duration,
+                output_path,
+                0,
+                target_width,
+                target_height,
+            )
+        return {
+            "provider": "static_narration",
+            "scene_kind": "image_narration",
+            "image": image_meta,
+            "duration_seconds": scene_duration,
+            "audio_mode": audio_mode,
+        }
+    finally:
+        for temp_path in temp_paths:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+async def generate_ai_video_scene_clips(
+    scenes: List[Dict],
+    project_dir: Path,
+    language: str,
+    voice_name: Optional[str],
+    style_prompt: Optional[str],
+    tts_provider: Optional[str],
+    visual_provider: Optional[str],
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Tuple[List[Path], List[Dict], str]:
+    clip_dir = project_dir / "clips"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    clip_paths: List[Path] = []
+    clip_metadata: List[Dict] = []
+    srt_items: List[Dict] = []
+    cursor = 0.0
+    for index, scene in enumerate(scenes, 1):
+        output_path = clip_dir / f"scene_{int(scene['scene_no']):03d}.mp4"
+        if progress_callback:
+            await report_progress(progress_callback, 12 + int((index - 1) / max(len(scenes), 1) * 58), f"Generating short scene clip {index}/{len(scenes)}")
+        scene_kind = scene.get("scene_kind") or "veo_clip"
+        if scene_kind == "veo_clip":
+            temp_paths: List[Path] = []
+            try:
+                narration_text = (scene.get("script") or "").strip()
+                if (scene.get("audio_mode") or "narrator") == "narrator" and narration_text:
+                    audio_path = OUTPUT_DIR / f"ai_scene_veo_tts_{uuid.uuid4().hex}.mp3"
+                    temp_paths.append(audio_path)
+                    audio_meta = await synthesize_audio_from_text(
+                        narration_text,
+                        language,
+                        audio_path,
+                        voice_name=voice_name,
+                        style_prompt=style_prompt,
+                        tts_provider=tts_provider,
+                    )
+                    audio_duration = max(float(audio_meta.get("duration_ms") or 0) / 1000.0, 2.0)
+                    target_duration = audio_duration + 0.35
+                    raw_scene = dict(scene)
+                    raw_video_path = clip_dir / f"scene_{int(scene['scene_no']):03d}_raw.mp4"
+                    temp_paths.append(raw_video_path)
+                    raw_meta = await asyncio.to_thread(generate_veo_scene_video, raw_scene, raw_video_path)
+                    visual_path = clip_dir / f"scene_{int(scene['scene_no']):03d}_visual.mp4"
+                    temp_paths.append(visual_path)
+                    await asyncio.to_thread(pad_or_trim_video_to_duration, raw_video_path, target_duration, visual_path)
+                    await asyncio.to_thread(mux_video_with_audio, visual_path, audio_path, output_path)
+                    meta = {
+                        "provider": "veo_visual_with_tts",
+                        "model": raw_meta.get("model"),
+                        "visual_generation_count": 1,
+                        "looped_to_match_audio": target_duration > raw_meta.get("duration_seconds", 0) + 0.05,
+                        "raw_visual": raw_meta,
+                        "duration_seconds": target_duration,
+                    }
+                    meta["tts_duration_seconds"] = audio_duration
+                    meta["audio_mode"] = "narrator"
+                else:
+                    meta = await asyncio.to_thread(generate_veo_scene_video, scene, output_path)
+                    meta["audio_mode"] = scene.get("audio_mode") or "silent"
+            finally:
+                for temp_path in temp_paths:
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+        else:
+            meta = await create_static_narration_scene_clip(
+                scene,
+                output_path,
+                project_dir,
+                language,
+                voice_name,
+                style_prompt,
+                tts_provider,
+                visual_provider,
+            )
+        duration = video_utils.media_duration_seconds(output_path)
+        if (scene.get("audio_mode") or "") == "veo_audio":
+            subtitle_text = (scene.get("dialogue") or scene.get("subtitle_text") or scene.get("script") or "").strip()
+        else:
+            subtitle_text = (scene.get("script") or "").strip()
+        if subtitle_text:
+            for start, end, text in split_segment_into_srt_entries(cursor, cursor + duration, subtitle_text):
+                srt_items.append({
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                })
+        clip_paths.append(output_path)
+        clip_metadata.append({
+            "scene_no": scene.get("scene_no"),
+            "scene_kind": scene_kind,
+            "audio_mode": scene.get("audio_mode"),
+            "path": str(output_path),
+            "duration_seconds": duration,
+            **meta,
+        })
+        cursor += duration
+    srt_text = build_srt_from_timed_items(srt_items)
+    return clip_paths, clip_metadata, srt_text
 
 
 def create_slide_segment(slide_path: Path, duration_seconds: float, output_path: Path, fade_seconds: float = LECTURE_SLIDE_FADE_SECONDS) -> None:
@@ -2797,6 +4154,226 @@ async def run_lecture_project_job(job_id: str, file_id: str, metadata: Dict):
         ai_usage.AI_USAGE_CONTEXT.reset(usage_token)
 
 
+async def run_ai_video_project_job(job_id: str, file_id: str, metadata: Dict):
+    async def job_progress(progress: int, message: str) -> None:
+        db.update_job(job_id, status="running", progress=progress, message=message)
+
+    usage_token = ai_usage.AI_USAGE_CONTEXT.set({"file_id": file_id, "job_id": job_id})
+    db.update_job(job_id, status="running", progress=4, message="AI video project started.")
+    try:
+        file = db.get_file_by_id(file_id)
+        if not file:
+            raise HTTPException(status_code=404, detail="AI video project file not found.")
+        language = metadata.get("language") or "ko"
+        final_output = metadata.get("final_output") or "captioned_dub_video"
+        scenes = metadata.get("scenes") or []
+        timeline_items = metadata.get("timeline_items") or ai_video_timeline_items(scenes)
+        project_dir = Path(metadata.get("project_dir") or MEDIA_DIR / f"ai_video_{file_id}")
+        project_dir.mkdir(parents=True, exist_ok=True)
+        base_name = sanitize_output_name(file.get("filename") or "ai_video_project")
+
+        if normalize_ai_video_visual_mode(metadata.get("visual_mode")) == "veo":
+            await job_progress(10, "Generating Veo short-form clips.")
+            clip_paths, clip_metadata, planned_srt = await generate_ai_video_scene_clips(
+                scenes,
+                project_dir,
+                language,
+                metadata.get("voice_name"),
+                metadata.get("style_prompt"),
+                metadata.get("tts_provider"),
+                metadata.get("visual_provider"),
+                progress_callback=job_progress,
+            )
+            if not clip_paths:
+                raise HTTPException(status_code=500, detail="No generated scene clips.")
+            metadata["clip_generation"] = clip_metadata
+            metadata["srt_source"] = "original"
+            if language == "en":
+                db.update_file_fields(file_id, english_srt_text=planned_srt)
+                metadata["srt_source"] = "english"
+            else:
+                db.update_file_fields(file_id, srt_text=planned_srt)
+            db.update_job(job_id, metadata=metadata)
+
+            await job_progress(74, "Editing short-form clips.")
+            short_video_path = OUTPUT_DIR / f"{base_name}_veo_shorts_{uuid.uuid4().hex[:8]}.mp4"
+            if len(clip_paths) == 1:
+                shutil.copyfile(clip_paths[0], short_video_path)
+            else:
+                await asyncio.to_thread(concat_video_sequence, clip_paths, short_video_path)
+            thumbnail_path = ""
+            candidate_thumbnail = THUMBNAIL_DIR / f"{short_video_path.stem}.jpg"
+            if await asyncio.to_thread(generate_video_thumbnail, short_video_path, candidate_thumbnail):
+                thumbnail_path = str(candidate_thumbnail)
+            db.update_file_fields(file_id, media_path=str(short_video_path), thumbnail_path=thumbnail_path)
+
+            video_artifact = db.create_artifact(
+                file_id,
+                "video",
+                language,
+                str(short_video_path),
+                short_video_path.name,
+                {
+                    "variant": "ai_video_veo_shorts",
+                    "clip_count": len(clip_paths),
+                    "clip_generation": clip_metadata,
+                    "srt_source": metadata["srt_source"],
+                    "duration_seconds": video_utils.media_duration_seconds(short_video_path),
+                },
+            )
+            result_artifact = video_artifact
+            if final_output == "audio":
+                audio_path = OUTPUT_DIR / f"{base_name}_veo_audio_{uuid.uuid4().hex[:8]}.mp3"
+                await asyncio.to_thread(export_preprocessed_audio, str(short_video_path), str(audio_path))
+                result_artifact = db.create_artifact(
+                    file_id,
+                    "audio",
+                    language,
+                    str(audio_path),
+                    audio_path.name,
+                    {
+                        "variant": "ai_video_veo_shorts",
+                        "source_video_artifact_id": video_artifact["id"],
+                        "clip_count": len(clip_paths),
+                    },
+                )
+                db.update_job(job_id, status="completed", progress=100, message="AI Veo short audio generated.", result_artifact_id=result_artifact["id"])
+                return
+            if final_output in {"subtitle_video", "captioned_dub_video"} and planned_srt.strip():
+                await job_progress(88, "Burning subtitles into Veo short.")
+                subtitle_style = SubtitleStyleRequest(**metadata["subtitle_style"]) if metadata.get("subtitle_style") else None
+                captioned_path = OUTPUT_DIR / f"{base_name}_veo_captioned_{uuid.uuid4().hex[:8]}.mp4"
+                normalized_style = await asyncio.to_thread(
+                    burn_subtitles_into_video,
+                    short_video_path,
+                    planned_srt,
+                    captioned_path,
+                    subtitle_style,
+                )
+                result_artifact = db.create_artifact(
+                    file_id,
+                    "captioned_dub_video" if final_output == "captioned_dub_video" else "subtitle_video",
+                    language,
+                    str(captioned_path),
+                    captioned_path.name,
+                    {
+                        "variant": "ai_video_veo_shorts",
+                        "source_video_artifact_id": video_artifact["id"],
+                        "subtitle_style": normalized_style,
+                        "srt_source": metadata["srt_source"],
+                        "clip_count": len(clip_paths),
+                    },
+                )
+            db.update_job(job_id, status="completed", progress=100, message="AI Veo short generated.", result_artifact_id=result_artifact["id"])
+            return
+
+        await job_progress(12, "Generating scene images.")
+        slide_manifest, image_metadata = await generate_ai_video_scene_images(
+            scenes,
+            project_dir,
+            visual_provider=metadata.get("visual_provider"),
+            progress_callback=job_progress,
+        )
+        metadata["slide_manifest"] = slide_manifest
+        metadata["image_generation"] = image_metadata
+        db.update_job(job_id, metadata=metadata)
+
+        await job_progress(50, "Generating narration voice.")
+        audio_output_path = OUTPUT_DIR / f"{base_name}_{language}_ai_video_audio_{uuid.uuid4().hex[:8]}.mp3"
+        audio_metadata = await synthesize_lecture_audio_by_slides(
+            timeline_items,
+            "",
+            language,
+            audio_output_path,
+            voice_name=metadata.get("voice_name"),
+            style_prompt=metadata.get("style_prompt"),
+            tts_provider=metadata.get("tts_provider"),
+            progress_callback=job_progress,
+            progress_start=50,
+            progress_end=72,
+        )
+        audio_artifact = db.create_artifact(
+            file_id,
+            "audio",
+            language,
+            str(audio_output_path),
+            audio_output_path.name,
+            {**audio_metadata, "srt_source": "generated", "variant": "ai_video_project"},
+        )
+
+        await job_progress(74, "Transcribing generated voice into actual SRT.")
+        generated_text, generated_srt = await transcribe_generated_lecture_audio(audio_output_path, language=language)
+        if not generated_srt:
+            raise HTTPException(status_code=500, detail="Generated audio transcription returned no SRT.")
+        generated_timeline_items = audio_metadata.get("generated_timeline_items") or timeline_items
+        aligned_srt, alignment_metadata = align_generated_srt_to_lecture_scripts(generated_srt, generated_timeline_items)
+        metadata["srt_alignment"] = alignment_metadata
+        if language == "en":
+            db.update_file_fields(file_id, original_text=file.get("original_text", ""), english_srt_text=aligned_srt)
+            metadata["srt_source"] = "english"
+        else:
+            db.update_file_fields(file_id, original_text=file.get("original_text", ""), srt_text=aligned_srt)
+            metadata["srt_source"] = "original"
+        db.update_job(job_id, metadata=metadata)
+
+        await job_progress(82, "Creating image video from generated voice durations.")
+        slide_paths = {name: Path(path) for name, path in slide_manifest.items()}
+        slide_video_path = OUTPUT_DIR / f"{base_name}_images_{uuid.uuid4().hex[:8]}.mp4"
+        await asyncio.to_thread(create_lecture_slide_video, generated_timeline_items, slide_paths, slide_video_path)
+        thumbnail_path = ""
+        candidate_thumbnail = THUMBNAIL_DIR / f"{slide_video_path.stem}.jpg"
+        if await asyncio.to_thread(generate_video_thumbnail, slide_video_path, candidate_thumbnail):
+            thumbnail_path = str(candidate_thumbnail)
+        db.update_file_fields(file_id, media_path=str(slide_video_path), thumbnail_path=thumbnail_path)
+
+        await job_progress(88, "Creating requested output.")
+        file = db.get_file_by_id(file_id)
+        subtitle_style = SubtitleStyleRequest(**metadata["subtitle_style"]) if metadata.get("subtitle_style") else None
+        result_artifact_id = audio_artifact["id"]
+        if final_output == "audio":
+            db.update_job(job_id, status="completed", progress=100, message="AI video audio generated.", result_artifact_id=result_artifact_id)
+            return
+        if final_output == "subtitle_video":
+            artifact = await create_subtitle_video_artifact_for_file(
+                file,
+                language,
+                srt_source=metadata.get("srt_source") or ("english" if language == "en" else "original"),
+                subtitle_style=subtitle_style,
+                progress_callback=job_progress,
+                progress_start=88,
+                progress_end=96,
+            )
+        elif final_output == "dub_video":
+            artifact = await create_video_artifact_for_file(
+                file,
+                language,
+                srt_source=metadata.get("srt_source") or ("english" if language == "en" else "original"),
+                audio_artifact_id=audio_artifact["id"],
+                require_existing_audio=True,
+                progress_callback=job_progress,
+                progress_start=88,
+                progress_end=96,
+            )
+        else:
+            artifact = await create_captioned_dub_video_artifact_for_file(
+                file,
+                language,
+                srt_source=metadata.get("srt_source") or ("english" if language == "en" else "original"),
+                subtitle_style=subtitle_style,
+                audio_artifact_id=audio_artifact["id"],
+                require_existing_audio=True,
+                progress_callback=job_progress,
+                progress_start=88,
+                progress_end=98,
+            )
+        db.update_job(job_id, status="completed", progress=100, message="AI video generated.", result_artifact_id=artifact["id"])
+    except Exception as e:
+        detail = getattr(e, "detail", str(e))
+        db.update_job(job_id, status="failed", progress=0, message="AI video project failed.", error=str(detail))
+    finally:
+        ai_usage.AI_USAGE_CONTEXT.reset(usage_token)
+
+
 @app.get("/api/lecture-projects/template")
 async def download_lecture_timeline_template():
     template = create_lecture_timeline_template()
@@ -2820,19 +4397,40 @@ async def create_lecture_project(
     subtitle_style: Optional[str] = Form(None),
 ):
     if not slides:
-        raise HTTPException(status_code=400, detail="At least one slide image is required.")
+        raise HTTPException(status_code=400, detail="At least one slide image or HTML file is required.")
     slide_payloads: List[Tuple[str, bytes]] = []
     seen_names = set()
     for slide in slides:
         filename = safe_upload_filename(slide.filename or "")
         if Path(filename).suffix.lower() not in LECTURE_SLIDE_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"Unsupported slide image: {filename}")
+            raise HTTPException(status_code=400, detail=f"Unsupported slide file: {filename}")
         if filename in seen_names:
             raise HTTPException(status_code=400, detail=f"Duplicate slide filename: {filename}")
         seen_names.add(filename)
         slide_payloads.append((filename, await slide.read()))
     timeline_content = await timeline_file.read()
-    validation = parse_lecture_timeline_xlsx(timeline_content, [name for name, _ in slide_payloads], "")
+    uploaded_names = [name for name, _ in slide_payloads]
+    validation = parse_lecture_timeline_xlsx(timeline_content, lecture_available_slide_references(uploaded_names), "")
+    document_slide_aliases: Dict[str, str] = {}
+    if validation["errors"] and can_auto_map_missing_slides_to_single_document(validation, uploaded_names):
+        document_filename = next(
+            name for name in uploaded_names
+            if Path(name).suffix.lower() in LECTURE_HTML_SLIDE_EXTENSIONS | LECTURE_PDF_SLIDE_EXTENSIONS
+        )
+        document_slide_aliases = build_single_document_slide_aliases(validation, document_filename)
+        validation = parse_lecture_timeline_xlsx(
+            timeline_content,
+            lecture_available_slide_references(uploaded_names) + list(document_slide_aliases.keys()),
+            "",
+        )
+        if document_slide_aliases and not validation["errors"]:
+            validation["warnings"] = [
+                warning for warning in validation["warnings"]
+                if document_filename not in warning
+            ]
+            validation["warnings"].append(
+                f"Mapped {len(document_slide_aliases)} XLSX slide filenames to '{document_filename}' pages by slide_no."
+            )
     if validation["errors"]:
         raise HTTPException(status_code=400, detail={"errors": validation["errors"], "warnings": validation["warnings"]})
     script_text = "\n".join(f"{item['slide_no']}. {item['text']}" for item in validation.get("scripts", []))
@@ -2858,10 +4456,62 @@ async def create_lecture_project(
     project_dir = MEDIA_DIR / f"lecture_{file_record['id']}"
     project_dir.mkdir(parents=True, exist_ok=True)
     slide_manifest: Dict[str, str] = {}
+    source_manifest: Dict[str, str] = {}
+    html_paths: Dict[str, Path] = {}
+    pdf_paths: Dict[str, Path] = {}
     for filename, content in slide_payloads:
         path = project_dir / filename
         path.write_bytes(content)
-        slide_manifest[filename] = str(path)
+        source_manifest[filename] = str(path)
+        suffix = Path(filename).suffix.lower()
+        if suffix in LECTURE_IMAGE_SLIDE_EXTENSIONS:
+            slide_manifest[filename] = str(path)
+        elif suffix in LECTURE_HTML_SLIDE_EXTENSIONS:
+            html_paths[filename] = path
+        elif suffix in LECTURE_PDF_SLIDE_EXTENSIONS:
+            pdf_paths[filename] = path
+
+    requested_html_refs: Dict[str, List[str]] = {}
+    requested_pdf_refs: Dict[str, List[str]] = {}
+    rendered_aliases: Dict[str, str] = {}
+    for item in validation["items"]:
+        slide_ref = item["slide_file"]
+        render_ref = document_slide_aliases.get(slide_ref, slide_ref)
+        if render_ref != slide_ref:
+            rendered_aliases[render_ref] = slide_ref
+        document_filename, slide_index = split_html_slide_reference(render_ref)
+        if document_filename in html_paths:
+            requested_html_refs.setdefault(document_filename, []).append(render_ref)
+        elif document_filename in pdf_paths:
+            requested_pdf_refs.setdefault(document_filename, []).append(render_ref)
+        elif Path(render_ref).suffix.lower() in LECTURE_HTML_SLIDE_EXTENSIONS and slide_index is None:
+            requested_html_refs.setdefault(render_ref, []).append(render_ref)
+        elif Path(render_ref).suffix.lower() in LECTURE_PDF_SLIDE_EXTENSIONS and slide_index is None:
+            requested_pdf_refs.setdefault(render_ref, []).append(render_ref)
+
+    if requested_html_refs:
+        render_dir = project_dir / "rendered_html_slides"
+        for html_filename, refs in requested_html_refs.items():
+            html_path = html_paths.get(html_filename)
+            if not html_path:
+                raise HTTPException(status_code=400, detail=f"HTML slide file was not uploaded: {html_filename}")
+            rendered_refs = await render_html_slide_refs(html_path, refs, render_dir)
+            slide_manifest.update(rendered_refs)
+            for rendered_ref, original_ref in rendered_aliases.items():
+                if rendered_ref in rendered_refs:
+                    slide_manifest[original_ref] = rendered_refs[rendered_ref]
+    if requested_pdf_refs:
+        render_dir = project_dir / "rendered_pdf_slides"
+        for pdf_filename, refs in requested_pdf_refs.items():
+            pdf_path = pdf_paths.get(pdf_filename)
+            if not pdf_path:
+                raise HTTPException(status_code=400, detail=f"PDF slide file was not uploaded: {pdf_filename}")
+            rendered_refs = await asyncio.to_thread(render_pdf_slide_refs, pdf_path, refs, render_dir)
+            slide_manifest.update(rendered_refs)
+            for rendered_ref, original_ref in rendered_aliases.items():
+                if rendered_ref in rendered_refs:
+                    slide_manifest[original_ref] = rendered_refs[rendered_ref]
+
     timeline_path = project_dir / safe_upload_filename(timeline_file.filename or "timeline.xlsx")
     timeline_path.write_bytes(timeline_content)
 
@@ -2877,6 +4527,8 @@ async def create_lecture_project(
         "script_text": script_text,
         "timeline_warnings": validation["warnings"],
         "slide_manifest": slide_manifest,
+        "source_slide_manifest": source_manifest,
+        "document_slide_aliases": document_slide_aliases,
         "timeline_path": str(timeline_path),
     }
     job = db.create_job(file_record["id"], "lecture_slide_project", metadata)
@@ -2887,6 +4539,133 @@ async def create_lecture_project(
         "job": job,
         "validation": validation,
     }
+
+
+@app.post("/api/ai-video-projects/draft")
+async def create_ai_video_project_draft(request: AiVideoDraftRequest):
+    draft = await asyncio.to_thread(generate_ai_video_draft, request)
+    return {"success": True, "draft": draft}
+
+
+@app.post("/api/ai-video-projects")
+async def create_ai_video_project(
+    request: AiVideoCreateRequest,
+    background_tasks: BackgroundTasks,
+):
+    draft = AI_VIDEO_DRAFTS.get(request.draft_id or "") if request.draft_id else None
+    source_scenes = request.scenes or [
+        AiVideoSceneRequest(**scene)
+        for scene in (draft.get("scenes", []) if draft else [])
+    ]
+    if not source_scenes:
+        raise HTTPException(status_code=400, detail="At least one scene is required.")
+    scene_limit = clamp_ai_video_scene_count(len(source_scenes))
+    scenes = [
+        normalize_ai_video_scene(scene.model_dump() if hasattr(scene, "model_dump") else scene.dict(), index + 1)
+        for index, scene in enumerate(source_scenes[:scene_limit])
+    ]
+    character_assets = merge_ai_video_character_assets(
+        default_ai_video_character_assets(),
+        (draft or {}).get("character_assets") or [],
+        request.character_assets or [],
+    )
+    attach_character_assets_to_scenes(scenes, character_assets)
+    title = (request.title or (draft or {}).get("title") or request.topic or "ai_video_project").strip()
+    topic = (request.topic or (draft or {}).get("topic") or title).strip()
+    language = (request.language or (draft or {}).get("language") or "ko").lower()
+    visual_mode = normalize_ai_video_visual_mode(request.visual_mode)
+    aspect_ratio, aspect_warning = resolve_ai_video_aspect_ratio(
+        request.image_style or (draft or {}).get("image_style") or "",
+        visual_mode,
+        request.aspect_ratio or (draft or {}).get("aspect_ratio"),
+    )
+    provider, normalized_voice = normalize_tts_selection(language, request.tts_provider, request.voice_name)
+    script_text = ai_video_script_text(scenes)
+    safe_title = sanitize_output_name(title or "ai_video_project")
+    file_record = db.create_file_record(
+        filename=f"{safe_title}.json",
+        file_type="ai_video_project",
+        original_text=script_text,
+        srt_text="",
+        english_srt_text="",
+    )
+    project_dir = MEDIA_DIR / f"ai_video_{file_record['id']}"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = project_dir / "draft.json"
+    draft_payload = {
+        "draft_id": request.draft_id or "",
+        "title": title,
+        "topic": topic,
+        "language": language,
+        "target_duration": request.target_duration or (draft or {}).get("target_duration") or "1-3분",
+        "audience": request.audience or (draft or {}).get("audience") or "일반 시청자",
+        "tone": request.tone or (draft or {}).get("tone") or "명확하고 자연스럽게",
+        "image_style": request.image_style or (draft or {}).get("image_style") or "",
+        "aspect_ratio": aspect_ratio,
+        "aspect_ratio_warning": aspect_warning or "",
+        "visual_mode": visual_mode,
+        "visual_provider": normalize_ai_video_visual_provider(request.visual_provider),
+        "character_assets": character_assets,
+        "research_mode": (draft or {}).get("research_mode") or "manual",
+        "scenes": scenes,
+    }
+    for scene in scenes:
+        scene["aspect_ratio"] = aspect_ratio
+    draft_path.write_text(json.dumps(draft_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata = {
+        **draft_payload,
+        "language": language,
+        "final_output": request.final_output or "captioned_dub_video",
+        "tts_provider": provider,
+        "voice_name": normalized_voice,
+        "style_prompt": request.style_prompt or "",
+        "srt_source": "english" if language == "en" else "original",
+        "subtitle_style": request.subtitle_style.model_dump() if hasattr(request.subtitle_style, "model_dump") and request.subtitle_style else (request.subtitle_style.dict() if request.subtitle_style else None),
+        "timeline_items": ai_video_timeline_items(scenes),
+        "script_text": script_text,
+        "project_dir": str(project_dir),
+        "draft_path": str(draft_path),
+    }
+    job = db.create_job(file_record["id"], "ai_video_project", metadata)
+    background_tasks.add_task(run_ai_video_project_job, job["id"], file_record["id"], metadata)
+    return {
+        "success": True,
+        "file": prepare_file_for_api(db.get_file_by_id(file_record["id"]), include_original=True),
+        "job": job,
+    }
+
+
+@app.post("/api/ai-video-projects/with-assets")
+async def create_ai_video_project_with_assets(
+    background_tasks: BackgroundTasks,
+    payload: str = Form(...),
+    character_images: Optional[List[UploadFile]] = File(None),
+):
+    try:
+        payload_data = json.loads(payload)
+        request = AiVideoCreateRequest(**payload_data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid AI video payload: {exc}") from exc
+    character_assets: List[Dict] = []
+    asset_dir = AI_CHARACTER_ASSET_DIR
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    for upload in character_images or []:
+        filename = safe_upload_filename(upload.filename or f"character_{uuid.uuid4().hex}.png")
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg"}:
+            raise HTTPException(status_code=400, detail=f"Unsupported character image file: {filename}")
+        content = await upload.read()
+        if not content:
+            continue
+        output_path = asset_dir / f"{uuid.uuid4().hex}_{filename}"
+        output_path.write_bytes(content)
+        character_assets.append({
+            "name": Path(filename).stem,
+            "filename": filename,
+            "path": str(output_path),
+        })
+    request.character_assets = [*(request.character_assets or []), *character_assets]
+    return await create_ai_video_project(request, background_tasks)
 
 
 @app.get("/api/files")

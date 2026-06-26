@@ -1129,6 +1129,10 @@ header p {
     font-weight: 700;
 }
 
+.lecture-project-grid .wide-field {
+    grid-column: 1 / -1;
+}
+
 .lecture-project-actions {
     display: flex;
     align-items: center;
@@ -1148,6 +1152,65 @@ header p {
 .lecture-validation-result ul {
     margin: 0;
     padding-left: 20px;
+}
+
+.ai-video-draft-panel {
+    display: grid;
+    gap: 16px;
+    padding: 16px;
+    border: 1px solid #d7dde8;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.ai-video-draft-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+}
+
+.ai-video-draft-header h3,
+.ai-video-draft-header p {
+    margin: 0;
+}
+
+.ai-video-scenes {
+    display: grid;
+    gap: 14px;
+}
+
+.ai-video-scene {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+    border: 1px solid #d7dde8;
+    border-radius: 8px;
+    background: #ffffff;
+}
+
+.ai-video-scene header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.ai-video-scene label {
+    display: grid;
+    gap: 6px;
+    font-weight: 700;
+}
+
+.ai-video-scene-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
+@media (max-width: 760px) {
+    .ai-video-scene-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 .muted-control {

@@ -1,5 +1,6 @@
 ﻿const homeSection = document.getElementById('homeSection');
 const lectureProjectSection = document.getElementById('lectureProjectSection');
+const aiVideoProjectSection = document.getElementById('aiVideoProjectSection');
 const videoEditorSection = document.getElementById('videoEditorSection');
 const artifactsSection = document.getElementById('artifactsSection');
 const settingsSection = document.getElementById('settingsSection');
@@ -83,6 +84,23 @@ const lectureToneSelect = document.getElementById('lectureToneSelect');
 const lectureCreateBtn = document.getElementById('lectureCreateBtn');
 const lectureProjectStatus = document.getElementById('lectureProjectStatus');
 const lectureValidationResult = document.getElementById('lectureValidationResult');
+const aiVideoTopicInput = document.getElementById('aiVideoTopicInput');
+const aiVideoLanguageSelect = document.getElementById('aiVideoLanguageSelect');
+const aiVideoDurationSelect = document.getElementById('aiVideoDurationSelect');
+const aiVideoAudienceInput = document.getElementById('aiVideoAudienceInput');
+const aiVideoToneSelect = document.getElementById('aiVideoToneSelect');
+const aiVideoAspectRatioSelect = document.getElementById('aiVideoAspectRatioSelect');
+const aiVideoImageStylePresetSelect = document.getElementById('aiVideoImageStylePresetSelect');
+const aiVideoImageStyleInput = document.getElementById('aiVideoImageStyleInput');
+const aiVideoCharacterInput = document.getElementById('aiVideoCharacterInput');
+const aiVideoVisualModeSelect = document.getElementById('aiVideoVisualModeSelect');
+const aiVideoOutputSelect = document.getElementById('aiVideoOutputSelect');
+const aiVideoProviderSelect = document.getElementById('aiVideoProviderSelect');
+const aiVideoVoiceSelect = document.getElementById('aiVideoVoiceSelect');
+const aiVideoDraftBtn = document.getElementById('aiVideoDraftBtn');
+const aiVideoCreateBtn = document.getElementById('aiVideoCreateBtn');
+const aiVideoProjectStatus = document.getElementById('aiVideoProjectStatus');
+const aiVideoDraftPanel = document.getElementById('aiVideoDraftPanel');
 
 const apiKeyInput = document.getElementById('apiKeyInput');
 const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
@@ -206,6 +224,7 @@ let currentPreviewMode = 'captioned_dub';
 let currentOutputType = 'captioned_dub';
 let renderedArtifactsKey = '';
 let renderedAllArtifactsKey = '';
+let currentAiVideoDraft = null;
 let subtitlePresetDirtyGuard = false;
 let srtEditDirty = {
     corrected: false,
@@ -393,6 +412,7 @@ function populateTtsProviderSelect(select, preferredProvider = '') {
 function populateTtsProviderSelects() {
     populateTtsProviderSelect(autoPipelineProvider, autoPipelineProvider?.value || activeTtsProvider);
     populateTtsProviderSelect(lectureProviderSelect, lectureProviderSelect?.value || 'gemini');
+    populateTtsProviderSelect(aiVideoProviderSelect, aiVideoProviderSelect?.value || 'gemini');
     populateTtsProviderSelect(generationTtsProviderSelect, generationTtsProviderSelect?.value || 'gemini');
 }
 
@@ -449,6 +469,30 @@ function populateLectureVoice(preferredVoice = '') {
     updateVoiceSamplePlayers();
 }
 
+function populateAiVideoVoice(preferredVoice = '') {
+    if (!aiVideoVoiceSelect) return;
+    const provider = aiVideoProviderSelect?.value || 'gemini';
+    const language = aiVideoLanguageSelect?.value || 'ko';
+    const providerData = ttsProviders[provider] || fallbackTtsProviders[provider];
+    const supportedLanguages = providerData?.languages || [];
+    const providerSupportsLanguage = supportedLanguages.length === 0 || supportedLanguages.includes(language);
+    const voicesForProvider = providerSupportsLanguage
+        ? (providerData?.voices || []).filter(voice => {
+            const languages = voice.languages || [];
+            return languages.length === 0 || languages.includes(language);
+        })
+        : [];
+    aiVideoVoiceSelect.disabled = voicesForProvider.length === 0;
+    if (!voicesForProvider.length) {
+        aiVideoVoiceSelect.innerHTML = '<option value="">지원되는 음성이 없습니다</option>';
+        return;
+    }
+    const defaultVoice = preferredVoice || providerData?.defaults?.[language] || voicesForProvider[0].name;
+    aiVideoVoiceSelect.innerHTML = voicesForProvider.map(voice =>
+        `<option value="${voice.name}" ${voice.name === defaultVoice ? 'selected' : ''}>${escapeHtml(voiceOptionText(provider, voice))}</option>`
+    ).join('');
+}
+
 function renderLectureValidation(validation) {
     if (!lectureValidationResult) return;
     const warnings = validation?.warnings || [];
@@ -478,12 +522,12 @@ async function createLectureProject() {
     const slideFiles = Array.from(lectureSlidesInput?.files || []);
     const timelineFile = lectureTimelineInput?.files?.[0];
     if (!slideFiles.length || !timelineFile) {
-        alert('슬라이드 이미지와 장표별 대본 엑셀을 모두 선택하세요.');
+        alert('슬라이드 파일과 장표별 대본 엑셀을 모두 선택하세요.');
         return;
     }
     const restore = setActionBusy(lectureCreateBtn, '강의 영상 생성 등록 중...');
     if (lectureProjectStatus) {
-        lectureProjectStatus.textContent = '장표별 대본 엑셀 검증 중...';
+        lectureProjectStatus.textContent = '장표 파일과 장표별 대본 엑셀 검증 중...';
         lectureProjectStatus.classList.remove('error');
     }
     if (lectureValidationResult) lectureValidationResult.classList.add('hidden');
@@ -518,6 +562,204 @@ async function createLectureProject() {
         if (lectureProjectStatus) {
             lectureProjectStatus.textContent = '검증 또는 등록 실패';
             lectureProjectStatus.classList.add('error');
+        }
+    } finally {
+        restore();
+    }
+}
+
+function aiVideoDraftRequestPayload() {
+    const characterNames = [...(aiVideoCharacterInput?.files || [])]
+        .map(file => file.name.replace(/\.[^.]+$/, '').trim())
+        .filter(Boolean);
+    return {
+        topic: aiVideoTopicInput?.value?.trim() || '',
+        language: aiVideoLanguageSelect?.value || 'ko',
+        target_duration: aiVideoDurationSelect?.value || '1-3분',
+        audience: aiVideoAudienceInput?.value?.trim() || '일반 시청자',
+        tone: aiVideoToneSelect?.value || '명확하고 자연스럽게',
+        image_style: aiVideoImageStyleInput?.value?.trim() || 'clean modern editorial illustration, cinematic lighting',
+        aspect_ratio: aiVideoAspectRatioSelect?.value || '9:16',
+        character_names: characterNames
+    };
+}
+
+function renderAiVideoDraft(draft) {
+    if (!aiVideoDraftPanel) return;
+    currentAiVideoDraft = draft;
+    aiVideoDraftPanel.classList.remove('hidden');
+    aiVideoDraftPanel.innerHTML = `
+        <div class="ai-video-draft-header">
+            <div>
+                <p class="workflow-kicker">shorts draft</p>
+                <h3>${escapeHtml(draft.title || 'AI 영상 초안')}</h3>
+                <p>${escapeHtml(draft.summary || '')}</p>
+            </div>
+            <span>${(draft.scenes || []).length} scenes</span>
+        </div>
+        <div class="ai-video-scenes">
+            ${(draft.scenes || []).map(scene => `
+                <article class="ai-video-scene" data-ai-scene="${scene.scene_no}">
+                    <header>
+                        <strong>장면 ${scene.scene_no}</strong>
+                    </header>
+                    <div class="ai-video-scene-grid">
+                        <label>
+                            <span>장면 유형</span>
+                            <select class="api-key-input" data-ai-scene-kind>
+                                <option value="veo_clip" ${scene.scene_kind === 'veo_clip' ? 'selected' : ''}>Veo 영상</option>
+                                <option value="image_narration" ${scene.scene_kind === 'image_narration' ? 'selected' : ''}>이미지+내레이션</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span>오디오</span>
+                            <select class="api-key-input" data-ai-scene-audio>
+                                <option value="narrator" ${scene.audio_mode === 'narrator' ? 'selected' : ''}>내레이션</option>
+                                <option value="veo_audio" ${scene.audio_mode === 'veo_audio' ? 'selected' : ''}>영상 자체 음성/효과음</option>
+                                <option value="silent" ${scene.audio_mode === 'silent' ? 'selected' : ''}>무음</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span>길이(초)</span>
+                            <input class="api-key-input" type="number" min="2" max="8" step="1" data-ai-scene-duration value="${escapeHtml(String(scene.duration_seconds || 5))}">
+                        </label>
+                    </div>
+                    <label>
+                        <span>기획/내레이션</span>
+                        <textarea class="api-key-input" rows="4" data-ai-scene-script>${escapeHtml(scene.script || '')}</textarea>
+                    </label>
+                    <label>
+                        <span>영상 프롬프트</span>
+                        <textarea class="api-key-input" rows="4" data-ai-scene-video-prompt>${escapeHtml(scene.video_prompt || '')}</textarea>
+                    </label>
+                    <label>
+                        <span>영상 내 대사</span>
+                        <textarea class="api-key-input" rows="2" data-ai-scene-dialogue>${escapeHtml(scene.dialogue || '')}</textarea>
+                    </label>
+                    <label>
+                        <span>효과음/분위기음</span>
+                        <input class="api-key-input" type="text" data-ai-scene-sound value="${escapeHtml(scene.sound_design || '')}">
+                    </label>
+                    <label>
+                        <span>자막</span>
+                        <input class="api-key-input" type="text" data-ai-scene-subtitle value="${escapeHtml(scene.script || '')}" disabled>
+                    </label>
+                    <label>
+                        <span>사용 캐릭터</span>
+                        <input class="api-key-input" type="text" data-ai-scene-characters value="${escapeHtml((scene.character_usage || []).join(', '))}">
+                    </label>
+                    <label>
+                        <span>캐릭터 역할</span>
+                        <input class="api-key-input" type="text" data-ai-scene-character-role value="${escapeHtml(scene.character_role || '')}">
+                    </label>
+                    <label>
+                        <span>비주얼 메모</span>
+                        <input class="api-key-input" type="text" data-ai-scene-notes value="${escapeHtml(scene.visual_notes || '')}">
+                    </label>
+                </article>
+            `).join('')}
+        </div>
+    `;
+    if (aiVideoCreateBtn) aiVideoCreateBtn.disabled = false;
+}
+
+function collectAiVideoScenes() {
+    return [...(aiVideoDraftPanel?.querySelectorAll('[data-ai-scene]') || [])].map((item, index) => ({
+        scene_no: Number(item.dataset.aiScene || index + 1),
+        script: item.querySelector('[data-ai-scene-script]')?.value?.trim() || '',
+        image_prompt: '',
+        visual_notes: item.querySelector('[data-ai-scene-notes]')?.value?.trim() || '',
+        scene_kind: item.querySelector('[data-ai-scene-kind]')?.value || 'veo_clip',
+        audio_mode: item.querySelector('[data-ai-scene-audio]')?.value || 'narrator',
+        video_prompt: item.querySelector('[data-ai-scene-video-prompt]')?.value?.trim() || '',
+        dialogue: item.querySelector('[data-ai-scene-dialogue]')?.value?.trim() || '',
+        sound_design: item.querySelector('[data-ai-scene-sound]')?.value?.trim() || '',
+        subtitle_text: item.querySelector('[data-ai-scene-subtitle]')?.value?.trim() || '',
+        duration_seconds: Number(item.querySelector('[data-ai-scene-duration]')?.value || 5),
+        character_usage: (item.querySelector('[data-ai-scene-characters]')?.value || '')
+            .split(',')
+            .map(name => name.trim())
+            .filter(Boolean),
+        character_role: item.querySelector('[data-ai-scene-character-role]')?.value?.trim() || ''
+    })).filter(scene => scene.script || scene.video_prompt);
+}
+
+async function createAiVideoDraft() {
+    const payload = aiVideoDraftRequestPayload();
+    if (!payload.topic) {
+        alert('영상 주제를 입력하세요.');
+        return;
+    }
+    const restore = setActionBusy(aiVideoDraftBtn, '초안 생성 중...');
+    if (aiVideoProjectStatus) {
+        aiVideoProjectStatus.textContent = '숏츠 초안을 생성 중...';
+        aiVideoProjectStatus.classList.remove('error');
+    }
+    if (aiVideoCreateBtn) aiVideoCreateBtn.disabled = true;
+    try {
+        const data = await postJson('/api/ai-video-projects/draft', payload);
+        renderAiVideoDraft(data.draft || {});
+        if (aiVideoProjectStatus) aiVideoProjectStatus.textContent = '초안이 생성되었습니다. 장면별 내레이션과 영상 프롬프트를 확인하세요.';
+    } catch (error) {
+        if (aiVideoProjectStatus) {
+            aiVideoProjectStatus.textContent = `초안 생성 실패: ${error.message}`;
+            aiVideoProjectStatus.classList.add('error');
+        }
+    } finally {
+        restore();
+    }
+}
+
+async function createAiVideoProject() {
+    const scenes = collectAiVideoScenes();
+    if (!scenes.length) {
+        alert('생성할 장면이 없습니다. 먼저 초안을 생성하세요.');
+        return;
+    }
+    const restore = setActionBusy(aiVideoCreateBtn, '영상 생성 등록 중...');
+    if (aiVideoProjectStatus) {
+        aiVideoProjectStatus.textContent = '음성/영상 생성 작업 등록 중...';
+        aiVideoProjectStatus.classList.remove('error');
+    }
+    try {
+        const payload = {
+            ...aiVideoDraftRequestPayload(),
+            draft_id: currentAiVideoDraft?.draft_id || '',
+            title: currentAiVideoDraft?.title || aiVideoTopicInput?.value?.trim() || 'AI 영상',
+            scenes,
+            visual_mode: aiVideoVisualModeSelect?.value || 'veo',
+            visual_provider: 'none',
+            final_output: aiVideoOutputSelect?.value || 'captioned_dub_video',
+            tts_provider: aiVideoProviderSelect?.value || 'gemini',
+            voice_name: aiVideoVoiceSelect?.disabled ? '' : aiVideoVoiceSelect?.value,
+            style_prompt: tonePrompts.clear_lecture,
+            subtitle_style: getSubtitleStyleOptions()
+        };
+        let data;
+        if (aiVideoCharacterInput?.files?.length) {
+            const formData = new FormData();
+            formData.append('payload', JSON.stringify(payload));
+            [...aiVideoCharacterInput.files].forEach(file => formData.append('character_images', file));
+            const response = await fetch('/api/ai-video-projects/with-assets', {
+                method: 'POST',
+                body: formData
+            });
+            data = await response.json();
+            if (!response.ok || data.success === false) {
+                throw new Error(data.detail || data.message || 'AI 영상 생성 등록 실패');
+            }
+        } else {
+            data = await postJson('/api/ai-video-projects', payload);
+        }
+        if (aiVideoProjectStatus) aiVideoProjectStatus.textContent = '작업이 등록되었습니다. 보드에서 진행 상황을 확인하세요.';
+        recentUploadedFileIds.add(data.file.id);
+        await loadBoard();
+        showSection('home');
+        openFileModal(data.file.id);
+    } catch (error) {
+        if (aiVideoProjectStatus) {
+            aiVideoProjectStatus.textContent = `영상 생성 등록 실패: ${error.message}`;
+            aiVideoProjectStatus.classList.add('error');
         }
     } finally {
         restore();
@@ -918,8 +1160,10 @@ function updateSubtitleDesignPreview() {
 }
 
 function showSection(section) {
+    if (section === 'ai_video_project') section = 'home';
     homeSection.classList.toggle('hidden', section !== 'home');
     if (lectureProjectSection) lectureProjectSection.classList.toggle('hidden', section !== 'lecture_project');
+    if (aiVideoProjectSection) aiVideoProjectSection.classList.add('hidden');
     if (videoEditorSection) videoEditorSection.classList.toggle('hidden', section !== 'video_editor');
     artifactsSection.classList.toggle('hidden', section !== 'artifacts');
     settingsSection.classList.toggle('hidden', section !== 'settings');
@@ -2650,6 +2894,7 @@ async function loadVoices() {
     populateVoiceSelect(generationLanguageSelect.value);
     populateAutoPipelineVoice(autoPipelineVoice?.value || '');
     populateLectureVoice(lectureVoiceSelect?.value || '');
+    populateAiVideoVoice(aiVideoVoiceSelect?.value || '');
 }
 
 async function checkApiKeyStatus() {
@@ -2670,7 +2915,9 @@ function aiOperationLabel(operation) {
         translate_en: '영어 자막 생성',
         correct_ko: '한국어 SRT 보정',
         summary: 'AI 요약',
-        gemini_text: 'Gemini 텍스트'
+        gemini_text: 'Gemini 텍스트',
+        ai_video_draft: 'AI 영상 초안',
+        image_generation: '이미지 생성'
     };
     return labels[operation] || operation || 'AI 작업';
 }
@@ -2986,6 +3233,27 @@ if (lectureVoiceSampleBtn) {
     lectureVoiceSampleBtn.addEventListener('click', playLectureVoiceSample);
 }
 if (lectureCreateBtn) lectureCreateBtn.addEventListener('click', createLectureProject);
+if (aiVideoLanguageSelect) {
+    aiVideoLanguageSelect.addEventListener('change', () => populateAiVideoVoice());
+}
+if (aiVideoProviderSelect) {
+    aiVideoProviderSelect.addEventListener('change', () => populateAiVideoVoice());
+}
+if (aiVideoImageStylePresetSelect) {
+    aiVideoImageStylePresetSelect.addEventListener('change', () => {
+        const value = aiVideoImageStylePresetSelect.value;
+        if (value !== 'custom' && aiVideoImageStyleInput) {
+            aiVideoImageStyleInput.value = value;
+        }
+    });
+}
+if (aiVideoImageStyleInput) {
+    aiVideoImageStyleInput.addEventListener('input', () => {
+        if (aiVideoImageStylePresetSelect) aiVideoImageStylePresetSelect.value = 'custom';
+    });
+}
+if (aiVideoDraftBtn) aiVideoDraftBtn.addEventListener('click', createAiVideoDraft);
+if (aiVideoCreateBtn) aiVideoCreateBtn.addEventListener('click', createAiVideoProject);
 if (selectUploadedBatchBtn) {
     selectUploadedBatchBtn.addEventListener('click', () => {
         batchUploadedList?.querySelectorAll('[data-batch-uploaded-file]').forEach(input => {
