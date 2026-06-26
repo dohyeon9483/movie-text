@@ -467,6 +467,194 @@ class MediaFeatureTests(unittest.TestCase):
         self.assertTrue(any("Gap before slide" in warning for warning in result["warnings"]))
         self.assertTrue(any("unused.png" in warning for warning in result["warnings"]))
 
+    def test_parse_lecture_timeline_accepts_html_slide_references(self):
+        content = self._lecture_xlsx([
+            ["slide_no", "slide_file", "script"],
+            [1, "deck.html#1", "First HTML slide"],
+            [2, "deck.html#2", "Second HTML slide"],
+        ])
+        result = main.parse_lecture_timeline_xlsx(
+            content,
+            main.lecture_available_slide_references(["deck.html"]),
+            "",
+        )
+
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["items"][0]["slide_file"], "deck.html#1")
+        self.assertFalse(any("deck.html" in warning for warning in result["warnings"]))
+
+    def test_single_uploaded_document_can_alias_legacy_image_filenames(self):
+        content = self._lecture_xlsx([
+            ["slide_no", "slide_file", "script"],
+            [1, "3-1-1-1-kr.png", "First slide"],
+            [2, "3-1-1-2-kr.png", "Second slide"],
+        ])
+        uploaded_names = ["Gemini 3-1-1.html"]
+        first_validation = main.parse_lecture_timeline_xlsx(
+            content,
+            main.lecture_available_slide_references(uploaded_names),
+            "",
+        )
+        self.assertTrue(main.can_auto_map_missing_slides_to_single_document(first_validation, uploaded_names))
+
+        aliases = main.build_single_document_slide_aliases(first_validation, uploaded_names[0])
+        self.assertEqual(aliases["3-1-1-1-kr.png"], "Gemini 3-1-1.html#1")
+        self.assertEqual(aliases["3-1-1-2-kr.png"], "Gemini 3-1-1.html#2")
+
+        second_validation = main.parse_lecture_timeline_xlsx(
+            content,
+            main.lecture_available_slide_references(uploaded_names) + list(aliases.keys()),
+            "",
+        )
+        self.assertEqual(second_validation["errors"], [])
+
+    def test_parse_lecture_timeline_accepts_pdf_page_references(self):
+        content = self._lecture_xlsx([
+            ["slide_no", "slide_file", "script"],
+            [1, "deck.pdf#1", "First PDF page"],
+            [2, "deck.pdf#2", "Second PDF page"],
+        ])
+        result = main.parse_lecture_timeline_xlsx(
+            content,
+            main.lecture_available_slide_references(["deck.pdf"]),
+            "",
+        )
+
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["items"][1]["slide_file"], "deck.pdf#2")
+        self.assertFalse(any("deck.pdf" in warning for warning in result["warnings"]))
+
+    def test_render_pdf_slide_refs_outputs_pngs(self):
+        fitz = importlib.import_module("fitz")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "deck.pdf"
+            document = fitz.open()
+            for label in ("Slide 1", "Slide 2"):
+                page = document.new_page(width=1280, height=720)
+                page.insert_text((72, 120), label, fontsize=48)
+            document.save(pdf_path)
+            document.close()
+
+            rendered = main.render_pdf_slide_refs(pdf_path, ["deck.pdf#1", "deck.pdf#2"], root / "rendered")
+
+            self.assertEqual(set(rendered), {"deck.pdf#1", "deck.pdf#2"})
+            self.assertTrue(Path(rendered["deck.pdf#1"]).exists())
+            self.assertGreater(Path(rendered["deck.pdf#2"]).stat().st_size, 0)
+
+    def test_ai_video_draft_uses_llm_only(self):
+        original_generate = main.generate_gemini_text
+        original_client = main.gemini_text_client
+        main.gemini_text_client = object()
+
+        def fake_generate(prompt, operation="gemini_text"):
+            self.assertIn("Return only valid JSON", prompt)
+            self.assertNotIn("Research notes:", prompt)
+            return (
+                '{"title":"Demo","summary":"Short summary","scenes":['
+                '{"scene_no":1,"script":"First narration.","video_prompt":"First video.","visual_notes":"A"},'
+                '{"scene_no":2,"script":"Second narration.","video_prompt":"Second video.","visual_notes":"B"}'
+                ']}'
+            )
+
+        main.generate_gemini_text = fake_generate
+        try:
+            draft = main.generate_ai_video_draft(main.AiVideoDraftRequest(topic="AI reports"))
+        finally:
+            main.generate_gemini_text = original_generate
+            main.gemini_text_client = original_client
+
+        self.assertEqual(draft["research_mode"], "llm_only")
+        self.assertEqual(draft["title"], "Demo")
+        self.assertEqual(len(draft["scenes"]), main.clamp_ai_video_scene_count())
+        self.assertEqual(draft["scenes"][0]["script"], "First narration.")
+
+    def test_character_appearance_is_stripped_from_video_prompt(self):
+        scene = main.normalize_ai_video_scene({
+            "scene_no": 1,
+            "script": "짧은 설명입니다.",
+            "video_prompt": (
+                "A curious white bear mascot with a blue AI headband gently holding "
+                "a single almond, looking at it inquisitively."
+            ),
+            "character_usage": ["캐릭터 에셋"],
+            "character_role": "gently holding a single almond",
+        }, 1)
+
+        self.assertIn("referenced character", scene["video_prompt"])
+        self.assertNotIn("white bear mascot", scene["video_prompt"].lower())
+        self.assertNotIn("blue ai headband", scene["video_prompt"].lower())
+
+    def test_veo_audio_prompt_allows_native_dialogue_and_sound(self):
+        scene = main.normalize_ai_video_scene({
+            "scene_no": 1,
+            "script": "아몬드를 발견했어!",
+            "video_prompt": "The referenced character finds an almond on a table.",
+            "audio_mode": "veo_audio",
+            "dialogue": "어? 이 아몬드 뭐지?",
+            "sound_design": "small pop sound, bright room ambience",
+        }, 1)
+
+        prompt = main.build_veo_scene_prompt(scene)
+
+        self.assertEqual(scene["audio_mode"], "veo_audio")
+        self.assertIn("Generate native video audio", prompt)
+        self.assertIn("어? 이 아몬드 뭐지?", prompt)
+        self.assertIn("small pop sound", prompt)
+        self.assertNotIn("No speech", prompt)
+
+    def test_default_character_assets_are_split_by_character(self):
+        assets = main.default_ai_video_character_assets()
+        names = {asset["name"] for asset in assets}
+
+        self.assertIn("오르", names)
+        self.assertIn("삐야", names)
+
+    def test_save_imagen_response_image_writes_bytes(self):
+        class _FakeImage:
+            image_bytes = b"fake-png"
+
+        class _FakeGenerated:
+            image = _FakeImage()
+
+        class _FakeResponse:
+            generated_images = [_FakeGenerated()]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "scene.png"
+            saved = main.save_imagen_response_image(_FakeResponse(), output_path)
+
+            self.assertTrue(saved)
+            self.assertEqual(output_path.read_bytes(), b"fake-png")
+
+    def test_save_gemini_generated_image_writes_base64_bytes(self):
+        class _FakeInlineData:
+            data = main.base64.b64encode(b"fake-nano-png").decode("ascii")
+
+        class _FakePart:
+            inline_data = _FakeInlineData()
+
+        class _FakeContent:
+            parts = [_FakePart()]
+
+        class _FakeCandidate:
+            content = _FakeContent()
+
+        class _FakeResponse:
+            candidates = [_FakeCandidate()]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "scene.png"
+            saved = main.save_gemini_generated_image(_FakeResponse(), output_path)
+
+            self.assertTrue(saved)
+            self.assertEqual(output_path.read_bytes(), b"fake-nano-png")
+
+    def test_ai_video_visual_provider_defaults_to_nano_banana(self):
+        self.assertEqual(main.normalize_ai_video_visual_provider(None), "nano_banana")
+        self.assertEqual(main.normalize_ai_video_visual_provider("gemini-image"), "nano_banana")
+        self.assertEqual(main.normalize_ai_video_visual_provider("imagen"), "imagen")
+
     def test_lecture_template_uses_single_slide_script_sheet(self):
         workbook = load_workbook(main.io.BytesIO(main.create_lecture_timeline_template()), read_only=True, data_only=True)
 
@@ -474,6 +662,8 @@ class MediaFeatureTests(unittest.TestCase):
         sheet = workbook["slides"]
         self.assertEqual([sheet["A1"].value, sheet["B1"].value, sheet["C1"].value], ["slide_no", "slide_file", "script"])
         self.assertTrue(str(sheet["C2"].value).strip())
+        self.assertIn(".html#", str(sheet["B3"].value))
+        self.assertIn(".pdf#", str(sheet["B5"].value))
 
     def test_align_generated_srt_uses_excel_script_with_actual_timings(self):
         generated_srt = (

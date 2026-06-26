@@ -8,7 +8,10 @@ from fastapi import HTTPException
 from openpyxl import Workbook, load_workbook
 
 
-LECTURE_SLIDE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+LECTURE_IMAGE_SLIDE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+LECTURE_HTML_SLIDE_EXTENSIONS = {".html", ".htm"}
+LECTURE_PDF_SLIDE_EXTENSIONS = {".pdf"}
+LECTURE_SLIDE_EXTENSIONS = LECTURE_IMAGE_SLIDE_EXTENSIONS | LECTURE_HTML_SLIDE_EXTENSIONS | LECTURE_PDF_SLIDE_EXTENSIONS
 LECTURE_SLIDE_HEADERS = {"slide_no", "slide_file", "script"}
 
 
@@ -130,7 +133,11 @@ def parse_lecture_timeline_xlsx(content: bytes, available_slide_files: List[str]
                 f"slide {previous['slide_no'] + 1} to {current['slide_no'] - 1}."
             )
 
-    unused = sorted(available - used_slide_files)
+    used_base_files = {str(name).split("#", 1)[0] for name in used_slide_files}
+    unused = sorted(
+        name for name in available - used_slide_files
+        if "#" not in name and name not in used_base_files
+    )
     if unused:
         warnings.append(f"Uploaded slide files not used in XLSX: {', '.join(unused)}.")
 
@@ -143,9 +150,9 @@ def create_lecture_timeline_template() -> bytes:
     sheet.title = "slides"
     sheet.append(["slide_no", "slide_file", "script"])
     sheet.append([1, "LLM_slide_1.png", "안녕하세요. 오늘 강의의 핵심을 짧게 설명하겠습니다. 첫 번째 슬라이드에서는 전체 개요를 소개합니다."])
-    sheet.append([2, "LLM_slide_2.png", "두 번째 슬라이드에서는 주요 개념을 설명합니다. 실제 발표처럼 자연스럽게 이어서 말하면 됩니다."])
-    sheet.append([3, "LLM_slide_3.png", "세 번째 슬라이드는 예시와 활용 방법을 다룹니다. 너무 길게 쓰기보다 장표 하나에 맞는 분량으로 작성하세요."])
-    sheet.append([4, "LLM_slide_4.png", "마지막으로 핵심 내용을 정리하고, 다음 단계에서 확인할 포인트를 안내합니다."])
+    sheet.append([2, "lecture_deck.html#1", "HTML 한 파일 안에 여러 장표가 있다면 파일명 뒤에 #1, #2처럼 장표 번호를 붙여 작성합니다."])
+    sheet.append([3, "lecture_deck.html#2", "서버는 해당 HTML 장표를 1920x1080 PNG로 렌더링한 뒤 기존 영상 생성 흐름에 연결합니다."])
+    sheet.append([4, "lecture_slides.pdf#1", "PDF 파일도 페이지 번호를 붙여 사용할 수 있습니다. 이미지, HTML, PDF 슬라이드를 섞어서 사용할 수 있습니다."])
     for column, width in {"A": 12, "B": 28, "C": 90}.items():
         sheet.column_dimensions[column].width = width
     buffer = io.BytesIO()
