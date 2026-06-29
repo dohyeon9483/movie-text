@@ -424,6 +424,29 @@ header p {
     align-items: center;
 }
 
+.upload-model-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 0 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    background: #f8fafc;
+    color: #475569;
+    font-size: 0.86rem;
+    white-space: nowrap;
+}
+
+.upload-model-control .api-key-input {
+    width: 190px;
+    min-width: 190px;
+    height: 34px;
+    padding: 0 8px;
+    font-size: 0.9rem;
+    background: white;
+}
+
 .board-filters {
     align-items: stretch;
     flex-direction: column;
@@ -3089,6 +3112,20 @@ header p {
     .board-filter-actions .btn-toolbar {
         flex: 1 1 100%;
         width: 100%;
+    }
+
+    .board-actions .btn-action,
+    .board-actions .upload-model-control {
+        width: 100%;
+    }
+
+    .upload-model-control {
+        justify-content: space-between;
+    }
+
+    .upload-model-control .api-key-input {
+        flex: 0 0 210px;
+        width: 210px;
     }
 
     .auto-pipeline-header,

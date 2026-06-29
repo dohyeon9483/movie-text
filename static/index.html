@@ -45,6 +45,15 @@
                 </div>
                 <div class="board-actions">
                     <input type="file" id="boardFileInput" accept=".mp4,.mov,.avi,.mkv,.webm,.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.opus,.txt,.srt" multiple hidden>
+                    <label class="upload-model-control" for="autoPipelineWhisperModel">
+                        <span>자막 추출</span>
+                        <select id="autoPipelineWhisperModel" class="api-key-input">
+                            <option value="large-v3" selected>정확도 우선 (large-v3)</option>
+                            <option value="turbo">빠르게 (turbo)</option>
+                            <option value="small">더 빠르게 (small)</option>
+                            <option value="base">가장 빠르게 (base)</option>
+                        </select>
+                    </label>
                     <button id="boardUploadBtn" class="btn-action primary">영상 여러 개 업로드</button>
                     <button id="openScriptJobBtn" class="btn-action secondary">SRT로 새 작업</button>
                     <span class="board-action-hint">파일 선택창에서 여러 영상을 한꺼번에 선택할 수 있습니다.</span>
