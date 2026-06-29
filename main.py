@@ -636,22 +636,47 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"사용 장치: {device}")
 
-# Whisper 모델 로드
-# 기본값은 정확도가 높은 large-v3입니다.
-# 속도나 메모리가 부담되면 환경변수 WHISPER_MODEL=turbo 로 실행하세요.
+# Whisper 모델은 업로드 설정에 따라 지연 로드하고 재사용합니다.
+# 기본값은 정확도가 높은 large-v3입니다. 빠른 처리가 필요하면 업로드 전 turbo/small/base를 선택합니다.
 default_whisper_model = "large-v3"
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", default_whisper_model)
-print(f"Whisper 모델('{WHISPER_MODEL_NAME}')을 {device}에 로드하는 중...")
-try:
-    model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
-except Exception as e:
-    if WHISPER_MODEL_NAME == "turbo":
-        raise
-    print(f"Whisper 모델('{WHISPER_MODEL_NAME}') 로드 실패: {e}")
-    WHISPER_MODEL_NAME = "turbo"
-    print(f"Whisper 모델('{WHISPER_MODEL_NAME}')로 다시 시도합니다.")
-    model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
-print("Whisper 모델 로드 완료!")
+WHISPER_MODEL_CHOICES = {
+    "large-v3": "정확도 우선",
+    "turbo": "속도 우선",
+    "small": "빠른 처리",
+    "base": "매우 빠른 처리",
+}
+loaded_whisper_models: Dict[str, object] = {}
+whisper_model_load_locks: Dict[str, asyncio.Lock] = {}
+
+
+def normalize_whisper_model_name(model_name: Optional[str]) -> str:
+    model_name = (model_name or WHISPER_MODEL_NAME or default_whisper_model).strip()
+    return model_name if model_name in WHISPER_MODEL_CHOICES else WHISPER_MODEL_NAME
+
+
+async def get_whisper_model(model_name: Optional[str] = None):
+    selected_model_name = normalize_whisper_model_name(model_name)
+    if selected_model_name in loaded_whisper_models:
+        return loaded_whisper_models[selected_model_name], selected_model_name
+
+    lock = whisper_model_load_locks.setdefault(selected_model_name, asyncio.Lock())
+    async with lock:
+        if selected_model_name in loaded_whisper_models:
+            return loaded_whisper_models[selected_model_name], selected_model_name
+        print(f"Whisper 모델('{selected_model_name}')을 {device}에 로드하는 중...")
+        try:
+            loaded_model = await asyncio.to_thread(whisper.load_model, selected_model_name, device=device)
+        except Exception as e:
+            if selected_model_name == "turbo":
+                raise
+            print(f"Whisper 모델('{selected_model_name}') 로드 실패: {e}")
+            selected_model_name = "turbo"
+            print(f"Whisper 모델('{selected_model_name}')로 다시 시도합니다.")
+            loaded_model = await asyncio.to_thread(whisper.load_model, selected_model_name, device=device)
+        loaded_whisper_models[selected_model_name] = loaded_model
+        print(f"Whisper 모델('{selected_model_name}') 로드 완료!")
+        return loaded_model, selected_model_name
 
 
 TARGET_AUDIO_DBFS = -20.0
@@ -883,7 +908,7 @@ async def extract_audio_from_video_async(video_path: str, audio_path: str) -> bo
     return await asyncio.to_thread(_extract)
 
 
-async def transcribe_audio_async_generator(audio_path: str, language: str = "ko"):
+async def transcribe_audio_async_generator(audio_path: str, language: str = "ko", whisper_model_name: Optional[str] = None):
     """Whisper를 사용하여 오디오를 텍스트로 변환합니다. 무음 구간을 제외하고 각 구간에 타임스탬프를 추가합니다."""
     try:
         # CPU 작업은 GPU 큐 밖에서 먼저 준비합니다.
@@ -900,9 +925,10 @@ async def transcribe_audio_async_generator(audio_path: str, language: str = "ko"
         if WHISPER_BEAM_SIZE > 1:
             decode_options["beam_size"] = WHISPER_BEAM_SIZE
 
-        yield {"type": "waiting", "total": len(chunks)}
+        selected_model, selected_model_name = await get_whisper_model(whisper_model_name)
+        yield {"type": "waiting", "total": len(chunks), "model": selected_model_name}
         async with transcription_semaphore:
-            yield {"type": "gpu_start", "total": len(chunks)}
+            yield {"type": "gpu_start", "total": len(chunks), "model": selected_model_name}
             for i, (chunk_start_ms, chunk_end_ms) in enumerate(chunks):
                 # 진행 상황 전달
                 yield {"type": "progress", "current": i + 1, "total": len(chunks)}
@@ -912,7 +938,7 @@ async def transcribe_audio_async_generator(audio_path: str, language: str = "ko"
 
                 # asyncio.to_thread를 사용하여 CPU/GPU 작업을 별도 스레드에서 실행
                 result = await asyncio.to_thread(
-                    model.transcribe,
+                    selected_model.transcribe,
                     chunk_samples,
                     language=language,
                     fp16=(device == "cuda"),
@@ -3788,7 +3814,7 @@ async def read_root():
         return f.read()
 
 
-async def process_single_file(file: UploadFile, file_index: int, total_files: int):
+async def process_single_file(file: UploadFile, file_index: int, total_files: int, whisper_model_name: Optional[str] = None):
     """단일 파일을 처리하고 진행 상황을 생성합니다."""
     file_prefix = f"[{file_index}/{total_files}] {file.filename}"
     filename_lower = file.filename.lower()
@@ -3926,13 +3952,16 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
             print(f"음성 인식 시작: {file.filename}")
 
             text = None
-            async for status in transcribe_audio_async_generator(str(audio_path), language="ko"):
+            selected_whisper_model = normalize_whisper_model_name(whisper_model_name)
+            async for status in transcribe_audio_async_generator(str(audio_path), language="ko", whisper_model_name=selected_whisper_model):
                 if status["type"] == "waiting":
                     total = status.get("total", 0)
-                    yield await upload_progress(f"{file_prefix}: GPU 음성 인식 대기 중 ({total} 구간 준비 완료)", 64, "processing")
+                    model_label = status.get("model") or selected_whisper_model
+                    yield await upload_progress(f"{file_prefix}: 음성 인식 대기 중 ({model_label}, {total} 구간 준비 완료)", 64, "processing")
                 elif status["type"] == "gpu_start":
                     total = status.get("total", 0)
-                    yield await upload_progress(f"{file_prefix}: GPU 음성 인식 시작 ({total} 구간)", 65, "processing")
+                    model_label = status.get("model") or selected_whisper_model
+                    yield await upload_progress(f"{file_prefix}: 음성 인식 시작 ({model_label}, {total} 구간)", 65, "processing")
                 elif status["type"] == "progress":
                     current = status["current"]
                     total = status["total"]
@@ -4007,7 +4036,10 @@ async def process_single_file(file: UploadFile, file_index: int, total_files: in
 
 
 @app.post("/upload")
-async def upload_videos(files: List[UploadFile] = File(...)):
+async def upload_videos(
+    files: List[UploadFile] = File(...),
+    whisper_model: Optional[str] = Form(None),
+):
     """여러 MP4 파일을 업로드하고 텍스트로 변환합니다 (SSE 스트리밍)."""
     
     async def event_generator():
@@ -4017,7 +4049,7 @@ async def upload_videos(files: List[UploadFile] = File(...)):
             
             # 각 파일을 순차적으로 처리
             for idx, file in enumerate(files, 1):
-                async for progress_msg in process_single_file(file, idx, total_files):
+                async for progress_msg in process_single_file(file, idx, total_files, whisper_model_name=whisper_model):
                     yield progress_msg
             
             # 모든 파일 처리 완료

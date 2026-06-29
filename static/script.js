@@ -31,6 +31,7 @@ const runUploadedBatchBtn = document.getElementById('runUploadedBatchBtn');
 const autoPipelineLanguage = document.getElementById('autoPipelineLanguage');
 const autoPipelineOutput = document.getElementById('autoPipelineOutput');
 const autoPipelineSubtitlePreset = document.getElementById('autoPipelineSubtitlePreset');
+const autoPipelineWhisperModel = document.getElementById('autoPipelineWhisperModel');
 const autoPipelineProvider = document.getElementById('autoPipelineProvider');
 const autoPipelineVoice = document.getElementById('autoPipelineVoice');
 const autoPipelineTone = document.getElementById('autoPipelineTone');
@@ -361,6 +362,7 @@ function saveAutoPipelineSettings() {
         language: autoPipelineLanguage?.value || 'en',
         final_output: autoPipelineOutput?.value || 'captioned_dub_video',
         subtitle_preset: autoPipelineSubtitlePreset?.value || defaultSubtitlePreset.id,
+        whisper_model: autoPipelineWhisperModel?.value || 'large-v3',
         tts_provider: autoPipelineProvider?.value || 'gemini',
         voice_name: autoPipelineVoice?.value || '',
         tone: autoPipelineTone?.value || 'bright_natural'
@@ -372,6 +374,7 @@ function loadAutoPipelineSettings() {
         const saved = JSON.parse(localStorage.getItem(autoPipelineStorageKey) || '{}');
         if (autoPipelineLanguage && saved.language) autoPipelineLanguage.value = saved.language;
         if (autoPipelineOutput && saved.final_output) autoPipelineOutput.value = saved.final_output;
+        if (autoPipelineWhisperModel && saved.whisper_model) autoPipelineWhisperModel.value = saved.whisper_model;
         populateAutoPipelineSubtitlePreset(saved.subtitle_preset || defaultSubtitlePreset.id);
         if (autoPipelineProvider && saved.tts_provider) {
             populateTtsProviderSelect(autoPipelineProvider, saved.tts_provider);
@@ -1309,6 +1312,7 @@ async function uploadVideos(fileList) {
     async function uploadOne(file, index) {
         const formData = new FormData();
         formData.append('files', file);
+        formData.append('whisper_model', autoPipelineWhisperModel?.value || 'large-v3');
         const response = await fetch('/upload', { method: 'POST', body: formData });
         if (!response.ok) throw new Error('업로드에 실패했습니다.');
         const reader = response.body.getReader();
@@ -1458,6 +1462,7 @@ async function runUploadTask(task) {
 
     const formData = new FormData();
     formData.append('files', file);
+    formData.append('whisper_model', autoPipelineWhisperModel?.value || 'large-v3');
     const response = await fetch('/upload', { method: 'POST', body: formData });
     if (!response.ok) throw new Error('업로드에 실패했습니다.');
 
@@ -3192,6 +3197,7 @@ if (deleteSelectedArtifactsBtn) {
 [
     autoPipelineOutput,
     autoPipelineSubtitlePreset,
+    autoPipelineWhisperModel,
     autoPipelineTone,
     autoPipelineVoice
 ].filter(Boolean).forEach(input => {
